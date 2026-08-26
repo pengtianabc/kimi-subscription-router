@@ -1,6 +1,7 @@
 //! kimi-switch 核心：数据模型 + Provider 抽象 + 凭证仓库 + 路径与配置。
 
 pub mod account_registry;
+pub mod acp_config;
 pub mod audit;
 pub mod defaults;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod swap;
 pub mod time;
 
 pub use account_registry::AccountRegistry;
+pub use acp_config::{AcpConfig, AcpTargetConfig};
 pub use audit::{AuditEvent, AuditLog};
 pub use error::{Error, Result};
 pub use model::{Account, AccountId, BillingKind, ClientTarget, Quota, QuotaStatus, QuotaWindow};

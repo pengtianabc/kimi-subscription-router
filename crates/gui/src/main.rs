@@ -10,18 +10,20 @@
 //! `block_on` 驱动 async API），UI 与 worker 之间用 `std::sync::mpsc` 传消息，
 //! worker 完成后通过 `egui::Context::request_repaint` 唤醒界面。
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use anyhow::Context as _;
 use eframe::egui;
 
-use kimi_switch_core::paths::AppPaths;
+use kimi_switch_core::paths::{valid_router_target, AppPaths};
 use kimi_switch_core::{
-    load_router_status, settings, AccountId, AccountRegistry, AuditEvent, AuditLog,
-    CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCache, QuotaWindow,
-    RemovedAccounts, RouterStatusSnapshot,
+    load_router_status, settings, AccountId, AccountRegistry, AcpConfig, AcpTargetConfig,
+    AuditEvent, AuditLog, CredentialStore, FileStore, KeyringStore, Provider, Quota, QuotaCache,
+    QuotaWindow, RemovedAccounts, RouterStatusSnapshot,
 };
 use kimi_switch_kimi::{device_flow, KimiProvider};
 
@@ -553,6 +555,7 @@ struct ToolbarActions {
     refresh: bool,
     import: bool,
     add: bool,
+    acp_settings: bool,
 }
 
 fn toolbar_action_buttons(
@@ -584,6 +587,16 @@ fn toolbar_action_buttons(
         .clicked()
     {
         actions.import = true;
+    }
+    if ui
+        .add_sized(
+            [42.0, 28.0],
+            egui::Button::new(egui::RichText::new("ACP").size(12.0)),
+        )
+        .on_hover_text("ACP 客户端与账号池")
+        .clicked()
+    {
+        actions.acp_settings = true;
     }
     if ui
         .add_enabled(
@@ -1247,8 +1260,6 @@ impl Backend {
     }
 }
 
-use anyhow::Context as _;
-
 /// worker 线程入口：初始化 → 同步本地激活账号 → 全量加载 → 循环处理请求。
 fn worker_main(ctx: egui::Context, rx: Receiver<Request>, tx: Sender<Response>) {
     let backend = match Backend::new() {
@@ -1535,6 +1546,75 @@ fn normalize_subscription_expiry(value: &str) -> anyhow::Result<Option<String>> 
     Ok(Some(date.format("%Y-%m-%d").to_string()))
 }
 
+/// 优先使用发布包内与 GUI 同目录的路由器，开发环境也能命中 target 目录中的二进制。
+fn default_router_command() -> String {
+    let binary_name = if cfg!(target_os = "windows") {
+        "kimi-subscription-router.exe"
+    } else {
+        "kimi-subscription-router"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join(binary_name)))
+        .filter(|candidate| candidate.is_file())
+        .map(|candidate| candidate.to_string_lossy().into_owned())
+        .unwrap_or_else(|| binary_name.to_string())
+}
+
+/// 合并并写入 VS Code 工作区设置，只覆盖本插件的四个配置键。
+fn write_vscode_workspace_settings(
+    workspace: &Path,
+    command: &str,
+    target: &AcpTargetConfig,
+) -> anyhow::Result<PathBuf> {
+    if !workspace.is_absolute() {
+        anyhow::bail!("VS Code 工作区必须使用绝对路径");
+    }
+    if !workspace.is_dir() {
+        anyhow::bail!("VS Code 工作区不存在或不是目录：{}", workspace.display());
+    }
+    let command = command.trim();
+    if command.is_empty() {
+        anyhow::bail!("ACP 路由器路径不能为空");
+    }
+
+    let vscode_dir = workspace.join(".vscode");
+    std::fs::create_dir_all(&vscode_dir)
+        .with_context(|| format!("创建 {} 失败", vscode_dir.display()))?;
+    let settings_path = vscode_dir.join("settings.json");
+    let raw = if settings_path.exists() {
+        std::fs::read_to_string(&settings_path)
+            .with_context(|| format!("读取 {} 失败", settings_path.display()))?
+    } else {
+        String::new()
+    };
+    let root = jsonc_parser::cst::CstRootNode::parse(&raw, &jsonc_parser::ParseOptions::default())
+        .with_context(|| format!("解析 {} 失败", settings_path.display()))?;
+    let settings = root
+        .object_value_or_create()
+        .ok_or_else(|| anyhow::anyhow!("{} 的根节点必须是 JSON 对象", settings_path.display()))?;
+    let update = |key: &str, value: jsonc_parser::cst::CstInputValue| {
+        if let Some(property) = settings.get(key) {
+            property.set_value(value);
+        } else {
+            settings.append(key, value);
+        }
+    };
+    update("kimifork.backend", "externalAcp".into());
+    update("kimifork.acpCommand", command.into());
+    update("kimifork.acpTarget", target.target.clone().into());
+    // 账号池由 App 的 acp-targets.toml 集中管理；空数组让路由器按 target 读取它。
+    update("kimifork.acpAccounts", Vec::<String>::new().into());
+
+    let serialized = root.to_string();
+    let temporary = settings_path.with_extension(format!("json.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, serialized)
+        .with_context(|| format!("写入 {} 失败", temporary.display()))?;
+    std::fs::rename(&temporary, &settings_path)
+        .with_context(|| format!("替换 {} 失败", settings_path.display()))?;
+    Ok(settings_path)
+}
+
 fn subscription_summary(
     ui: &mut egui::Ui,
     rows: &[AccountRow],
@@ -1632,6 +1712,16 @@ struct AuthDialog {
     cancel: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct AcpTargetDraft {
+    original_target: Option<String>,
+    target: String,
+    use_all_accounts: bool,
+    accounts: Vec<String>,
+    workspace_path: String,
+    command: String,
+}
+
 struct GuiApp {
     to_worker: Sender<Request>,
     from_worker: Receiver<Response>,
@@ -1647,6 +1737,12 @@ struct GuiApp {
     rename_target: Option<(String, String)>,
     subscription_expiry_target: Option<(String, String)>,
     auth_dialog: Option<AuthDialog>,
+    acp_config: AcpConfig,
+    acp_config_error: Option<String>,
+    acp_settings_open: bool,
+    acp_cli_accounts_draft: Vec<String>,
+    acp_target_draft: Option<AcpTargetDraft>,
+    last_acp_workspace: String,
     dark_mode: bool,
     control_info: Option<control::Info>,
     control_error: Option<String>,
@@ -1675,10 +1771,15 @@ impl GuiApp {
             Ok(info) => (Some(info), None),
             Err(error) => (None, Some(format!("{error:#}"))),
         };
-        let auto_refresh_interval_ms = settings::reload_from_file()
+        let gui_settings = settings::reload_from_file()
             .unwrap_or_else(|_| settings::current())
             .gui
-            .auto_refresh_interval_ms;
+            .clone();
+        let auto_refresh_interval_ms = gui_settings.auto_refresh_interval_ms;
+        let (acp_config, acp_config_error) = match AcpConfig::load_default() {
+            Ok(config) => (config, None),
+            Err(error) => (AcpConfig::default(), Some(error.to_string())),
+        };
         #[cfg(any(target_os = "windows", target_os = "macos"))]
         let tray = desktop_tray::DesktopTray::new(desktop_tray::TrayContext {
             icon_data: icon,
@@ -1715,6 +1816,12 @@ impl GuiApp {
             rename_target: None,
             subscription_expiry_target: None,
             auth_dialog: None,
+            acp_config,
+            acp_config_error,
+            acp_settings_open: false,
+            acp_cli_accounts_draft: Vec::new(),
+            acp_target_draft: None,
+            last_acp_workspace: gui_settings.last_acp_workspace,
             dark_mode,
             control_info,
             control_error,
@@ -1749,6 +1856,517 @@ impl GuiApp {
             Request::StartDeviceAuth(cancel),
             "正在获取授权链接…".to_string(),
         );
+    }
+
+    fn open_acp_settings(&mut self) {
+        match AcpConfig::load_default() {
+            Ok(config) => {
+                self.acp_cli_accounts_draft = config.cli_reserved_accounts.clone();
+                self.acp_config = config;
+                self.acp_config_error = None;
+                self.acp_settings_open = true;
+            }
+            Err(error) => {
+                self.acp_config_error = Some(error.to_string());
+                self.acp_settings_open = true;
+                self.status = format!("读取 ACP 配置失败：{error}");
+                self.status_tone = Tone::Err;
+            }
+        }
+    }
+
+    fn save_acp_config(&mut self, config: AcpConfig) -> anyhow::Result<()> {
+        config.save_default()?;
+        self.acp_config = config;
+        self.acp_config_error = None;
+        Ok(())
+    }
+
+    fn save_cli_reserved_accounts(&mut self) {
+        let mut accounts = self.acp_cli_accounts_draft.clone();
+        accounts.sort();
+        accounts.dedup();
+        let mut next = self.acp_config.clone();
+        next.cli_reserved_accounts = accounts.clone();
+        match self.save_acp_config(next) {
+            Ok(()) => {
+                self.acp_cli_accounts_draft = accounts;
+                self.status =
+                    "已保存 Kimi CLI 保留账号池；重新加载运行中的 ACP 客户端后生效".to_string();
+                self.status_tone = Tone::Ok;
+            }
+            Err(error) => {
+                self.status = format!("保存 Kimi CLI 保留账号池失败：{error}");
+                self.status_tone = Tone::Err;
+            }
+        }
+    }
+
+    fn remember_acp_workspace(&mut self, workspace: &str) -> anyhow::Result<()> {
+        settings::set_gui_last_acp_workspace(workspace)?;
+        self.last_acp_workspace = workspace.to_string();
+        Ok(())
+    }
+
+    fn commit_acp_target(&mut self, mut draft: AcpTargetDraft, write_vscode: bool) {
+        let target = draft.target.trim().to_string();
+        if !valid_router_target(&target) {
+            self.status =
+                "target 无效：只能使用小写字母、数字、点、下划线和连字符，且首尾必须是字母或数字"
+                    .to_string();
+            self.status_tone = Tone::Err;
+            self.acp_target_draft = Some(draft);
+            return;
+        }
+        if !draft.use_all_accounts && draft.accounts.is_empty() {
+            self.status = "请至少选择一个账号，或勾选使用所有参与路由账号".to_string();
+            self.status_tone = Tone::Err;
+            self.acp_target_draft = Some(draft);
+            return;
+        }
+        draft.accounts.sort();
+        draft.accounts.dedup();
+        let target_config = AcpTargetConfig {
+            target: target.clone(),
+            accounts: if draft.use_all_accounts {
+                Vec::new()
+            } else {
+                draft.accounts.clone()
+            },
+        };
+        let mut next = self.acp_config.clone();
+        if let Some(original) = draft.original_target.as_deref() {
+            if original != target && next.targets.iter().any(|entry| entry.target == target) {
+                self.status = format!("target {target} 已存在");
+                self.status_tone = Tone::Err;
+                self.acp_target_draft = Some(draft);
+                return;
+            }
+            if let Some(entry) = next
+                .targets
+                .iter_mut()
+                .find(|entry| entry.target == original)
+            {
+                *entry = target_config.clone();
+            }
+        } else {
+            if next.targets.iter().any(|entry| entry.target == target) {
+                self.status = format!("target {target} 已存在");
+                self.status_tone = Tone::Err;
+                self.acp_target_draft = Some(draft);
+                return;
+            }
+            next.targets.push(target_config.clone());
+        }
+
+        if next.targets.len() > 1 && next.targets.iter().any(|entry| entry.accounts.is_empty()) {
+            self.status =
+                "配置多个 target 时，每个 target 都必须选择明确且互不重叠的账号池".to_string();
+            self.status_tone = Tone::Err;
+            self.acp_target_draft = Some(draft);
+            return;
+        }
+        let mut assigned = std::collections::HashSet::new();
+        if let Some(account) = next
+            .targets
+            .iter()
+            .flat_map(|entry| &entry.accounts)
+            .find(|account| !assigned.insert((*account).clone()))
+        {
+            self.status = format!("账号 {account} 已分配给另一个 target");
+            self.status_tone = Tone::Err;
+            self.acp_target_draft = Some(draft);
+            return;
+        }
+
+        if let Err(error) = next.clone().save_default() {
+            self.status = format!("保存 ACP 配置失败：{error}");
+            self.status_tone = Tone::Err;
+            self.acp_target_draft = Some(draft);
+            return;
+        }
+        self.acp_config = next;
+        self.acp_config_error = None;
+
+        if write_vscode {
+            let workspace = draft.workspace_path.trim();
+            let command = draft.command.trim();
+            match write_vscode_workspace_settings(Path::new(workspace), command, &target_config) {
+                Ok(path) => match self.remember_acp_workspace(workspace) {
+                    Ok(()) => {
+                        self.status =
+                            format!("已保存 {target}，VS Code 配置已写入 {}", path.display());
+                        self.status_tone = Tone::Ok;
+                    }
+                    Err(error) => {
+                        self.status = format!(
+                            "VS Code 配置已写入 {}，但保存最近工作区失败：{error}",
+                            path.display()
+                        );
+                        self.status_tone = Tone::Err;
+                    }
+                },
+                Err(error) => {
+                    self.status = format!("target 已保存，但写入 VS Code 配置失败：{error}");
+                    self.status_tone = Tone::Err;
+                }
+            }
+        } else {
+            self.status = format!("已保存 ACP target {target}，重新加载对应客户端后生效");
+            self.status_tone = Tone::Ok;
+        }
+        self.acp_target_draft = None;
+    }
+
+    fn delete_acp_target(&mut self, target: &str) {
+        let mut next = self.acp_config.clone();
+        next.targets.retain(|entry| entry.target != target);
+        match self.save_acp_config(next) {
+            Ok(()) => {
+                self.status = format!("已删除 ACP target {target}");
+                self.status_tone = Tone::Ok;
+            }
+            Err(error) => {
+                self.status = format!("删除 ACP target 失败：{error}");
+                self.status_tone = Tone::Err;
+            }
+        }
+    }
+
+    fn show_acp_settings(&mut self, ctx: &egui::Context) {
+        if !self.acp_settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut edit_target: Option<AcpTargetDraft> = None;
+        let mut delete_target: Option<String> = None;
+        let mut save_target: Option<(AcpTargetDraft, bool)> = None;
+        let mut save_cli_accounts = false;
+        let mut selected_workspace: Option<PathBuf> = None;
+        let mut cancel_edit = false;
+        let targets = self.acp_config.targets.clone();
+        let router_targets = self.router_status.targets.clone();
+        let rows = self
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.id.clone(),
+                    row.label.clone(),
+                    row.routing_enabled,
+                    row.active,
+                )
+            })
+            .collect::<Vec<_>>();
+        let cli_reserved_accounts = self.acp_config.cli_reserved_accounts.clone();
+
+        egui::Window::new("ACP 客户端与账号池")
+            .collapsible(false)
+            .resizable(true)
+            .default_size([620.0, 520.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .id_salt("acp-settings-scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                ui.label("Kimi CLI 保留池与各 ACP target 账号池互斥；不同 target 之间也不能重复分配。");
+                ui.add_space(6.0);
+                if let Some(error) = &self.acp_config_error {
+                    ui.colored_label(COLOR_FULL, format!("配置文件错误：{error}"));
+                }
+                ui.heading("Kimi CLI 保留账号");
+                ui.label(
+                    egui::RichText::new(
+                        "保留账号不会进入 App 管理的 ACP target；官方 CLI 仍需保持登录到这些账号之一。",
+                    )
+                    .small()
+                    .weak(),
+                );
+                egui::ScrollArea::vertical()
+                    .id_salt("kimi-cli-account-pool")
+                    .max_height(120.0)
+                    .show(ui, |ui| {
+                        for (id, label, _, active) in &rows {
+                            let mut selected = self
+                                .acp_cli_accounts_draft
+                                .iter()
+                                .any(|account| account == id);
+                            let conflict = targets.iter().find(|entry| {
+                                entry.accounts.iter().any(|account| account == id)
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_enabled_ui(conflict.is_none(), |ui| {
+                                    if ui.checkbox(&mut selected, "").changed() {
+                                        if selected {
+                                            self.acp_cli_accounts_draft.push(id.clone());
+                                        } else {
+                                            self.acp_cli_accounts_draft
+                                                .retain(|account| account != id);
+                                        }
+                                    }
+                                });
+                                ui.label(label);
+                                let detail = if let Some(target) = conflict {
+                                    format!("{id} · 已分配给 {}", target.target)
+                                } else if *active {
+                                    format!("{id} · 当前 Kimi CLI 账号")
+                                } else {
+                                    id.clone()
+                                };
+                                ui.label(egui::RichText::new(detail).small().weak());
+                            });
+                        }
+                    });
+                if ui
+                    .add_enabled(
+                        self.acp_config_error.is_none(),
+                        egui::Button::new("保存 CLI 账号池"),
+                    )
+                    .clicked()
+                {
+                    save_cli_accounts = true;
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.heading("已配置 target");
+                    if ui
+                        .add_enabled(
+                            self.acp_config_error.is_none(),
+                            egui::Button::new("＋ 新建"),
+                        )
+                        .clicked()
+                    {
+                        edit_target = Some(AcpTargetDraft {
+                            original_target: None,
+                            target: String::new(),
+                            use_all_accounts: targets.is_empty(),
+                            accounts: Vec::new(),
+                            workspace_path: self.last_acp_workspace.clone(),
+                            command: default_router_command(),
+                        });
+                    }
+                });
+                if targets.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "尚未配置。未配置 target 时，客户端传入的参数仍然有效。",
+                        )
+                        .weak(),
+                    );
+                } else {
+                    for entry in &targets {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(&entry.target).strong());
+                            let pool = if entry.accounts.is_empty() {
+                                if cli_reserved_accounts.is_empty() {
+                                    "所有参与路由账号".to_string()
+                                } else {
+                                    "除 Kimi CLI 保留池外的所有账号".to_string()
+                                }
+                            } else {
+                                format!("{} 个账号", entry.accounts.len())
+                            };
+                            ui.label(egui::RichText::new(pool).small().weak());
+                            let running = router_targets
+                                .iter()
+                                .find(|status| status.target == entry.target);
+                            let runtime_label = match running {
+                                Some(status) if status.running => {
+                                    format!("运行中 · {} 个会话", status.session_count)
+                                }
+                                _ => "未运行".to_string(),
+                            };
+                            ui.label(egui::RichText::new(runtime_label).small().color(
+                                if running.is_some_and(|status| status.running) {
+                                    COLOR_OK
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                },
+                            ));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("×").on_hover_text("删除 target").clicked() {
+                                        delete_target = Some(entry.target.clone());
+                                    }
+                                    if ui.button("✎").on_hover_text("编辑 target").clicked() {
+                                        edit_target = Some(AcpTargetDraft {
+                                            original_target: Some(entry.target.clone()),
+                                            target: entry.target.clone(),
+                                            use_all_accounts: entry.accounts.is_empty(),
+                                            accounts: entry.accounts.clone(),
+                                            workspace_path: self.last_acp_workspace.clone(),
+                                            command: default_router_command(),
+                                        });
+                                    }
+                                },
+                            );
+                        });
+                        ui.separator();
+                    }
+                }
+
+                if let Some(draft) = self.acp_target_draft.as_mut() {
+                    ui.add_space(4.0);
+                    ui.heading(if draft.original_target.is_some() {
+                        "编辑 target"
+                    } else {
+                        "新建 target"
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Target");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.target)
+                                .hint_text("例如 kimi-vscode-fork")
+                                .desired_width(220.0),
+                        );
+                    });
+                    ui.checkbox(
+                        &mut draft.use_all_accounts,
+                        "使用除 Kimi CLI 保留池外的所有参与路由账号",
+                    );
+                    ui.label(egui::RichText::new("账号池").strong());
+                    egui::ScrollArea::vertical()
+                        .id_salt("acp-account-pool")
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            for (id, label, routing_enabled, _) in &rows {
+                                let mut selected =
+                                    draft.accounts.iter().any(|account| account == id);
+                                let target_conflict = targets.iter().find_map(|entry| {
+                                    (entry.target
+                                        != draft.original_target.as_deref().unwrap_or_default()
+                                        && (entry.accounts.is_empty()
+                                            || entry.accounts.iter().any(|account| account == id)))
+                                        .then_some(entry.target.as_str())
+                                });
+                                let reserved_for_cli =
+                                    cli_reserved_accounts.iter().any(|account| account == id);
+                                ui.horizontal(|ui| {
+                                    ui.add_enabled_ui(
+                                        !draft.use_all_accounts
+                                            && target_conflict.is_none()
+                                            && !reserved_for_cli,
+                                        |ui| {
+                                            if ui.checkbox(&mut selected, "").changed() {
+                                                if selected {
+                                                    if !draft
+                                                        .accounts
+                                                        .iter()
+                                                        .any(|account| account == id)
+                                                    {
+                                                        draft.accounts.push(id.clone());
+                                                    }
+                                                } else {
+                                                    draft.accounts.retain(|account| account != id);
+                                                }
+                                            }
+                                        },
+                                    );
+                                    ui.label(label);
+                                    ui.label(
+                                        egui::RichText::new(if reserved_for_cli {
+                                            format!("{id} · 已保留给 Kimi CLI")
+                                        } else if let Some(target) = target_conflict {
+                                            format!("{id} · 已分配给 {target}")
+                                        } else if *routing_enabled {
+                                            id.clone()
+                                        } else {
+                                            format!("{id} · 已暂停路由")
+                                        })
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                            }
+                        });
+                    ui.separator();
+                    ui.label(egui::RichText::new("写入 VS Code 工作区").strong());
+                    ui.horizontal(|ui| {
+                        ui.label("工作区");
+                        let path_width = (ui.available_width() - 42.0).max(120.0);
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.workspace_path)
+                                .hint_text("/absolute/path/to/project")
+                                .desired_width(path_width),
+                        );
+                        #[cfg(any(target_os = "windows", target_os = "macos"))]
+                        if ui
+                            .button("...")
+                            .on_hover_text("选择工作区文件夹")
+                            .clicked()
+                        {
+                            let initial = Path::new(draft.workspace_path.trim());
+                            let initial = if initial.is_dir() {
+                                initial
+                            } else {
+                                Path::new(&self.last_acp_workspace)
+                            };
+                            let mut dialog = rfd::FileDialog::new().set_title("选择 VS Code 工作区");
+                            if initial.is_dir() {
+                                dialog = dialog.set_directory(initial);
+                            }
+                            selected_workspace = dialog.pick_folder();
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("路由器");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut draft.command)
+                                .desired_width(ui.available_width()),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("保存").clicked() {
+                            save_target = Some((draft.clone(), false));
+                        }
+                        if ui
+                            .add_enabled(
+                                !draft.workspace_path.trim().is_empty(),
+                                egui::Button::new("保存并写入 VS Code"),
+                            )
+                            .clicked()
+                        {
+                            save_target = Some((draft.clone(), true));
+                        }
+                        if ui.button("取消").clicked() {
+                            cancel_edit = true;
+                        }
+                    });
+                }
+                    });
+            });
+
+        if !open {
+            self.acp_settings_open = false;
+            self.acp_target_draft = None;
+        }
+        if save_cli_accounts {
+            self.save_cli_reserved_accounts();
+        }
+        if let Some(path) = selected_workspace {
+            let workspace = path.to_string_lossy().into_owned();
+            if let Some(draft) = self.acp_target_draft.as_mut() {
+                draft.workspace_path = workspace.clone();
+            }
+            if let Err(error) = self.remember_acp_workspace(&workspace) {
+                self.status = format!("保存最近工作区失败：{error}");
+                self.status_tone = Tone::Err;
+            }
+        }
+        if let Some(draft) = edit_target {
+            self.acp_target_draft = Some(draft);
+        }
+        if cancel_edit {
+            self.acp_target_draft = None;
+        }
+        if let Some(target) = delete_target {
+            self.delete_acp_target(&target);
+        }
+        if let Some((draft, write_vscode)) = save_target {
+            self.commit_acp_target(draft, write_vscode);
+        }
     }
 }
 
@@ -2373,6 +2991,9 @@ impl eframe::App for GuiApp {
                 }
             }
         }
+        if toolbar_actions.acp_settings && !self.busy {
+            self.open_acp_settings();
+        }
         if toolbar_actions.refresh && !self.busy {
             self.send(Request::Refresh, "正在刷新额度…".to_string());
         } else if toolbar_actions.import && !self.busy {
@@ -2583,6 +3204,8 @@ impl eframe::App for GuiApp {
             }
         }
 
+        self.show_acp_settings(ctx);
+
         if self.busy || self.auth_dialog.is_some() {
             ctx.request_repaint_after(Duration::from_millis(120));
         } else if self.auto_refresh_interval_ms > 0 {
@@ -2603,9 +3226,10 @@ impl eframe::App for GuiApp {
 mod tests {
     use super::{
         account_matches_filter, account_remaining, auto_refresh_status, mask_email,
-        normalize_subscription_expiry, reset_display_text, toggled_account_selection, AccountRow,
-        QuotaView,
+        normalize_subscription_expiry, reset_display_text, toggled_account_selection,
+        write_vscode_workspace_settings, AccountRow, QuotaView,
     };
+    use kimi_switch_core::AcpTargetConfig;
 
     #[test]
     fn auto_refresh_status_describes_off_and_selected_interval() {
@@ -2701,5 +3325,42 @@ mod tests {
     fn subscription_expiry_rejects_invalid_date() {
         assert!(normalize_subscription_expiry("2026-02-30").is_err());
         assert!(normalize_subscription_expiry("09/30/2026").is_err());
+    }
+
+    #[test]
+    fn vscode_workspace_settings_preserve_other_keys_and_delegate_pool_to_app() {
+        let temp = tempfile::tempdir().unwrap();
+        let vscode = temp.path().join(".vscode");
+        std::fs::create_dir_all(&vscode).unwrap();
+        std::fs::write(
+            vscode.join("settings.json"),
+            r#"{
+                // 用户原有设置
+                "editor.formatOnSave": true,
+                "kimifork.backend": "embedded",
+            }"#,
+        )
+        .unwrap();
+        let target = AcpTargetConfig {
+            target: "kimi-vscode-fork".into(),
+            accounts: vec!["account-b".into(), "account-c".into()],
+        };
+
+        let path = write_vscode_workspace_settings(
+            temp.path(),
+            "/Applications/Kimi Subscription Router.app/Contents/MacOS/kimi-subscription-router",
+            &target,
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(raw.contains("// 用户原有设置"));
+        let settings: serde_json::Value =
+            jsonc_parser::parse_to_serde_value(&raw, &Default::default())
+                .unwrap()
+                .unwrap();
+        assert_eq!(settings["editor.formatOnSave"], true);
+        assert_eq!(settings["kimifork.backend"], "externalAcp");
+        assert_eq!(settings["kimifork.acpTarget"], "kimi-vscode-fork");
+        assert_eq!(settings["kimifork.acpAccounts"], serde_json::json!([]));
     }
 }

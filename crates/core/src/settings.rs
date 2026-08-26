@@ -26,6 +26,7 @@
 //! [gui]
 //! auto_refresh_interval_ms = 300000
 //! dark_mode = true
+//! last_acp_workspace = "/absolute/path/to/project"
 //! ```
 
 use std::path::Path;
@@ -116,6 +117,8 @@ pub struct Gui {
     pub auto_refresh_interval_ms: u64,
     /// 是否使用深色主题。
     pub dark_mode: bool,
+    /// ACP 界面最近一次选择的 VS Code 工作区；只保存本机路径。
+    pub last_acp_workspace: String,
 }
 
 impl Default for AutoSwap {
@@ -174,6 +177,7 @@ impl Default for Gui {
         Self {
             auto_refresh_interval_ms: defaults::GUI_AUTO_REFRESH_INTERVAL_MS,
             dark_mode: true,
+            last_acp_workspace: String::new(),
         }
     }
 }
@@ -278,6 +282,18 @@ fn set_gui_dark_mode_at(path: &Path, dark_mode: bool) -> Result<()> {
     })
 }
 
+/// 将 `[gui] last_acp_workspace` 写入默认配置，其余字段保持不变。
+pub fn set_gui_last_acp_workspace(workspace: &str) -> Result<()> {
+    let path = AppPaths::resolve()?.config_file();
+    set_gui_last_acp_workspace_at(&path, workspace)
+}
+
+fn set_gui_last_acp_workspace_at(path: &Path, workspace: &str) -> Result<()> {
+    update_config_at(path, |doc| {
+        doc["gui"]["last_acp_workspace"] = toml_edit::value(workspace);
+    })
+}
+
 fn update_config_at(path: &Path, update: impl FnOnce(&mut toml_edit::DocumentMut)) -> Result<()> {
     let mut doc: toml_edit::DocumentMut = if path.exists() {
         let raw = std::fs::read_to_string(path)
@@ -325,6 +341,7 @@ mod tests {
             defaults::GUI_AUTO_REFRESH_INTERVAL_MS
         );
         assert!(s.gui.dark_mode);
+        assert!(s.gui.last_acp_workspace.is_empty());
     }
 
     #[test]
@@ -414,5 +431,28 @@ auto_refresh_interval_ms = 900000
         assert!(!settings.auto_swap.enabled);
         assert_eq!(settings.gui.auto_refresh_interval_ms, 900_000);
         assert!(!settings.gui.dark_mode);
+    }
+
+    #[test]
+    fn gui_workspace_update_preserves_other_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[auto_swap]
+enabled = false
+
+[gui]
+dark_mode = false
+"#,
+        )
+        .unwrap();
+
+        set_gui_last_acp_workspace_at(&path, "/tmp/example-workspace").unwrap();
+
+        let settings = load_from(&path).unwrap();
+        assert!(!settings.auto_swap.enabled);
+        assert!(!settings.gui.dark_mode);
+        assert_eq!(settings.gui.last_acp_workspace, "/tmp/example-workspace");
     }
 }

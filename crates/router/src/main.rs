@@ -11,10 +11,12 @@ use anyhow::{bail, Context, Result};
 use clap::Parser;
 use fs2::FileExt;
 use kimi_subscription_router::home::AccountHome;
-use kimi_subscription_router::routing::{PoolExhausted, RouteSelector};
+use kimi_subscription_router::routing::{routing_enabled, PoolExhausted, RouteSelector};
 use kimi_subscription_router::state::{RouterState, StateStore};
-use kimi_switch_core::paths::AppPaths;
-use kimi_switch_core::{Account, AccountRegistry, CredentialStore, FileStore, KeyringStore};
+use kimi_switch_core::paths::{router_account_dir_name, valid_router_target, AppPaths};
+use kimi_switch_core::{
+    Account, AccountId, AccountRegistry, AcpConfig, CredentialStore, FileStore, KeyringStore,
+};
 use kimi_switch_kimi::KimiProvider;
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -37,6 +39,14 @@ struct Cli {
     /// Log level (equivalent to RUST_LOG). Logs are written to stderr.
     #[arg(long, default_value = "warn")]
     log: String,
+
+    /// 独立 ACP 客户端目标。不同目标拥有独立锁、会话和 owner 状态。
+    #[arg(long, default_value = "default")]
+    target: String,
+
+    /// 只允许指定账号进入此目标；可重复传入。缺省使用所有已开启路由的账号。
+    #[arg(long = "account")]
+    accounts: Vec<String>,
 }
 
 struct InstanceLock {
@@ -44,7 +54,7 @@ struct InstanceLock {
 }
 
 impl InstanceLock {
-    fn acquire(path: &Path) -> Result<Self> {
+    fn acquire(path: &Path, conflict_message: impl Into<String>) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -54,8 +64,9 @@ impl InstanceLock {
             .write(true)
             .truncate(false)
             .open(path)?;
+        let conflict_message = conflict_message.into();
         file.try_lock_exclusive()
-            .context("another Kimi subscription router is already running")?;
+            .with_context(|| conflict_message)?;
         Ok(Self { file })
     }
 }
@@ -72,6 +83,24 @@ struct ChildPeer {
     home: AccountHome,
     stdin: ChildStdin,
     _process: Child,
+    _account_lease: InstanceLock,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AccountScope {
+    /// 使用所有参与路由的账号，但排除为官方 Kimi CLI 保留的账号。
+    AllExcept(HashSet<String>),
+    /// 只使用明确指定的账号池。
+    Only(HashSet<String>),
+}
+
+impl AccountScope {
+    fn explicitly_included(&self) -> Option<&HashSet<String>> {
+        match self {
+            Self::AllExcept(_) => None,
+            Self::Only(accounts) => Some(accounts),
+        }
+    }
 }
 
 impl ChildPeer {
@@ -203,6 +232,8 @@ struct Router {
     child_events: mpsc::UnboundedSender<ChildEvent>,
     child_sequence: u64,
     sequence: u64,
+    paths: AppPaths,
+    account_scope: AccountScope,
 }
 
 impl Router {
@@ -250,8 +281,7 @@ impl Router {
                 },
             }
         }
-        self.sync_routing_accounts().await;
-        self.absorb_all_credentials();
+        self.shutdown_all_children().await;
         Ok(())
     }
 
@@ -469,6 +499,17 @@ impl Router {
             return Ok(());
         }
         tracing::warn!(account = %account_id, "Kimi ACP child exited");
+        if self
+            .registry
+            .find("kimi", &AccountId(account_id.to_string()))?
+            .is_some()
+        {
+            if let Some(peer) = self.peers.get(account_id) {
+                if let Err(error) = peer.home.absorb_credentials(&self.provider) {
+                    tracing::warn!(account = %account_id, err = %error, "persist exited Kimi ACP credentials failed");
+                }
+            }
+        }
         self.peers.remove(account_id);
         self.warming.remove(account_id);
         self.reverse_requests
@@ -891,6 +932,31 @@ impl Router {
         }
     }
 
+    /// 正常退出时先停止官方进程，再回灌轮换凭证并移除目标内副本。
+    async fn shutdown_all_children(&mut self) {
+        let account_ids = self.peers.keys().cloned().collect::<Vec<_>>();
+        for account_id in account_ids {
+            let Some(mut peer) = self.peers.remove(&account_id) else {
+                continue;
+            };
+            if let Err(error) = peer.stdin.shutdown().await {
+                tracing::debug!(account = %account_id, err = %error, "close Kimi ACP stdin during shutdown failed");
+            }
+            if let Err(error) = peer._process.start_kill() {
+                tracing::debug!(account = %account_id, err = %error, "stop Kimi ACP child during shutdown failed");
+            }
+            if let Err(error) = peer._process.wait().await {
+                tracing::debug!(account = %account_id, err = %error, "wait for Kimi ACP child during shutdown failed");
+            }
+            if let Err(error) = peer.home.absorb_credentials(&self.provider) {
+                tracing::warn!(account = %account_id, err = %error, "persist Kimi ACP credentials during shutdown failed");
+            }
+            if let Err(error) = peer.home.purge_credentials() {
+                tracing::warn!(account = %account_id, err = %error, "purge Kimi ACP credentials during shutdown failed");
+            }
+        }
+    }
+
     fn handle_warming_response(&mut self, account_id: &str, message: &Value) -> bool {
         if !self.warming.contains(account_id) {
             return false;
@@ -930,13 +996,18 @@ impl Router {
     }
 
     async fn sync_routing_accounts(&mut self) {
-        let accounts = match self.registry.list_by_provider("kimi") {
+        let registered_accounts = match self.registry.list_by_provider("kimi") {
             Ok(accounts) => accounts,
             Err(error) => {
                 tracing::warn!(err = %error, "reload routing accounts failed");
                 return;
             }
         };
+        let registered = registered_accounts
+            .iter()
+            .map(|account| account.id.0.clone())
+            .collect::<HashSet<_>>();
+        let accounts = accounts_for_target(registered_accounts, &self.account_scope);
         let desired = accounts
             .iter()
             .map(|account| account.id.0.clone())
@@ -959,6 +1030,11 @@ impl Router {
                 if let Err(error) = peer._process.wait().await {
                     tracing::debug!(account = %account_id, err = %error, "wait for removed Kimi ACP child failed");
                 }
+                if registered.contains(&account_id) {
+                    if let Err(error) = peer.home.absorb_credentials(&self.provider) {
+                        tracing::warn!(account = %account_id, err = %error, "persist stopped Kimi ACP credentials failed");
+                    }
+                }
                 if let Err(error) = peer.home.purge_credentials() {
                     tracing::warn!(account = %account_id, err = %error, "purge removed account credentials failed");
                 }
@@ -972,6 +1048,13 @@ impl Router {
             if self.peers.contains_key(&account.id.0) {
                 continue;
             }
+            let account_lease = match acquire_account_lease(&self.paths, &account.id.0) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    tracing::warn!(account = %account.id, err = %error, "skip Kimi account leased by another ACP target");
+                    continue;
+                }
+            };
             let home = match AccountHome::prepare(
                 &self.router_root,
                 &self.shared_sessions,
@@ -988,6 +1071,7 @@ impl Router {
             match spawn_child(
                 &self.kimi_binary,
                 home,
+                account_lease,
                 self.child_sequence,
                 self.child_events.clone(),
             )
@@ -1141,6 +1225,7 @@ async fn write_output(message: &Value) -> Result<()> {
 async fn spawn_child(
     kimi_binary: &Path,
     home: AccountHome,
+    account_lease: InstanceLock,
     generation: u64,
     events: mpsc::UnboundedSender<ChildEvent>,
 ) -> Result<ChildPeer> {
@@ -1176,7 +1261,52 @@ async fn spawn_child(
         home,
         stdin,
         _process: process,
+        _account_lease: account_lease,
     })
+}
+
+fn accounts_for_target(accounts: Vec<Account>, account_scope: &AccountScope) -> Vec<Account> {
+    accounts
+        .into_iter()
+        .filter(|account| {
+            routing_enabled(account)
+                && match account_scope {
+                    AccountScope::AllExcept(excluded) => !excluded.contains(&account.id.0),
+                    AccountScope::Only(included) => included.contains(&account.id.0),
+                }
+        })
+        .collect()
+}
+
+fn account_scope_for_target(
+    paths: &AppPaths,
+    target: &str,
+    explicit_accounts: &[String],
+) -> Result<AccountScope> {
+    if !explicit_accounts.is_empty() {
+        return Ok(AccountScope::Only(
+            explicit_accounts.iter().cloned().collect(),
+        ));
+    }
+    let config = AcpConfig::load(&paths.acp_config_file())?;
+    if let Some(entry) = config.target(target) {
+        if !entry.accounts.is_empty() {
+            return Ok(AccountScope::Only(entry.accounts.iter().cloned().collect()));
+        }
+    }
+    Ok(AccountScope::AllExcept(
+        config.cli_reserved_accounts.into_iter().collect(),
+    ))
+}
+
+fn acquire_account_lease(paths: &AppPaths, account_id: &str) -> Result<InstanceLock> {
+    InstanceLock::acquire(
+        &paths.router_account_lock_file(account_id),
+        format!(
+            "Kimi account {} is already leased by another ACP target",
+            router_account_dir_name(account_id)
+        ),
+    )
 }
 
 async fn read_child_lines<R>(
@@ -1235,21 +1365,57 @@ fn build_provider(
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    if !valid_router_target(&cli.target) {
+        bail!(
+            "invalid ACP target; use 1-64 lowercase ASCII letters, digits, '.', '_' or '-', starting and ending with a letter or digit"
+        );
+    }
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cli.log));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(cli.log.clone()));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 
     let paths = AppPaths::resolve()?;
-    let _instance_lock = InstanceLock::acquire(&paths.router_lock_file())?;
-    let (provider, registry, accounts) = build_provider(&paths)?;
-    if accounts.is_empty() {
+    let account_scope = account_scope_for_target(&paths, &cli.target, &cli.accounts)?;
+    let _instance_lock = InstanceLock::acquire(
+        &paths.router_lock_file_for_target(&cli.target),
+        format!(
+            "another Kimi subscription router is already running for target {}",
+            cli.target
+        ),
+    )?;
+    let (provider, registry, registered_accounts) = build_provider(&paths)?;
+    if registered_accounts.is_empty() {
         bail!("no Kimi accounts; add an account in Kimi Subscription Router first");
     }
+    if let Some(included_accounts) = account_scope.explicitly_included() {
+        let registered = registered_accounts
+            .iter()
+            .map(|account| account.id.0.as_str())
+            .collect::<HashSet<_>>();
+        let missing = included_accounts
+            .iter()
+            .filter(|account_id| !registered.contains(account_id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            bail!(
+                "unknown Kimi account(s) requested for ACP target: {}",
+                missing.join(", ")
+            );
+        }
+    }
+    let accounts = accounts_for_target(registered_accounts, &account_scope);
+    if accounts.is_empty() {
+        bail!(
+            "no enabled Kimi accounts for ACP target {}; enable routing for at least one selected account",
+            cli.target
+        );
+    }
 
-    let router_root = paths.router_data_dir();
+    let router_root = paths.router_data_dir_for_target(&cli.target);
     let shared_sessions = router_root.join("sessions");
     fs::create_dir_all(&router_root)?;
     let (events_tx, events_rx) = mpsc::unbounded_channel();
@@ -1257,10 +1423,25 @@ async fn main() -> Result<()> {
     let mut available_accounts = Vec::new();
     let mut child_sequence = 0_u64;
     for account in accounts {
+        let account_lease = match acquire_account_lease(&paths, &account.id.0) {
+            Ok(lease) => lease,
+            Err(error) => {
+                tracing::warn!(account = %account.id, err = %error, "skip Kimi account leased by another ACP target");
+                continue;
+            }
+        };
         match AccountHome::prepare(&router_root, &shared_sessions, &account, &provider) {
             Ok(home) => {
                 child_sequence = child_sequence.wrapping_add(1);
-                match spawn_child(&cli.kimi_binary, home, child_sequence, events_tx.clone()).await {
+                match spawn_child(
+                    &cli.kimi_binary,
+                    home,
+                    account_lease,
+                    child_sequence,
+                    events_tx.clone(),
+                )
+                .await
+                {
                     Ok(peer) => {
                         peers.insert(account.id.0.clone(), peer);
                         available_accounts.push(account);
@@ -1279,7 +1460,7 @@ async fn main() -> Result<()> {
         bail!("no Kimi account could start an ACP child");
     }
 
-    let state_store = StateStore::new(paths.router_state_file());
+    let state_store = StateStore::new(paths.router_state_file_for_target(&cli.target));
     let state = state_store.load()?;
     let selector = RouteSelector::new(available_accounts, paths.quota_cache_file());
     Router {
@@ -1302,6 +1483,8 @@ async fn main() -> Result<()> {
         child_events: events_tx,
         child_sequence,
         sequence: 0,
+        paths,
+        account_scope,
     }
     .run(events_rx)
     .await
@@ -1310,6 +1493,20 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+
+    fn account(id: &str) -> Account {
+        Account {
+            provider: "kimi".into(),
+            id: AccountId(id.into()),
+            label: id.into(),
+            active: false,
+            created_at: Utc::now(),
+            last_used_at: None,
+            priority: 100,
+            extra: Map::new(),
+        }
+    }
 
     #[test]
     fn recognizes_only_explicit_quota_errors() {
@@ -1322,6 +1519,179 @@ mod tests {
         assert!(!response_is_quota_exhausted(
             &json!({"result": {"stopReason": "end_turn"}})
         ));
+    }
+
+    #[test]
+    fn target_scope_only_keeps_enabled_selected_accounts() {
+        let enabled = account("enabled");
+        let mut disabled = account("disabled");
+        disabled
+            .extra
+            .insert("routing_enabled".into(), false.into());
+        let outside = account("outside");
+        let scope = AccountScope::Only(
+            ["enabled".to_string(), "disabled".to_string()]
+                .into_iter()
+                .collect(),
+        );
+
+        let selected = accounts_for_target(vec![enabled, disabled, outside], &scope);
+        assert_eq!(
+            selected
+                .iter()
+                .map(|account| account.id.0.as_str())
+                .collect::<Vec<_>>(),
+            vec!["enabled"]
+        );
+    }
+
+    #[test]
+    fn empty_target_scope_uses_all_enabled_accounts() {
+        let enabled = account("enabled");
+        let mut manual = account("manual");
+        manual.extra.insert("manual_only".into(), true.into());
+
+        let selected = accounts_for_target(
+            vec![enabled, manual],
+            &AccountScope::AllExcept(HashSet::new()),
+        );
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id.0, "enabled");
+    }
+
+    #[test]
+    fn target_scope_comes_from_app_config_when_cli_omits_accounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+        };
+        let config = AcpConfig {
+            cli_reserved_accounts: Vec::new(),
+            targets: vec![kimi_switch_core::AcpTargetConfig {
+                target: "kimi-vscode-fork".into(),
+                accounts: vec!["account-b".into(), "account-c".into()],
+            }],
+        };
+        config.save(&paths.acp_config_file()).unwrap();
+
+        let scope = account_scope_for_target(&paths, "kimi-vscode-fork", &[]).unwrap();
+        assert_eq!(
+            scope,
+            AccountScope::Only(HashSet::from(["account-b".into(), "account-c".into()]))
+        );
+    }
+
+    #[test]
+    fn explicit_cli_accounts_override_app_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+        };
+        let config = AcpConfig {
+            cli_reserved_accounts: vec!["account-cli".into()],
+            targets: vec![kimi_switch_core::AcpTargetConfig {
+                target: "kimi-vscode-fork".into(),
+                accounts: vec!["account-from-app".into()],
+            }],
+        };
+        config.save(&paths.acp_config_file()).unwrap();
+
+        let scope =
+            account_scope_for_target(&paths, "kimi-vscode-fork", &["account-from-cli".into()])
+                .unwrap();
+        assert_eq!(
+            scope,
+            AccountScope::Only(HashSet::from(["account-from-cli".into()]))
+        );
+    }
+
+    #[test]
+    fn implicit_target_scope_excludes_cli_reserved_accounts() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+        };
+        let config = AcpConfig {
+            cli_reserved_accounts: vec!["account-cli".into()],
+            targets: vec![kimi_switch_core::AcpTargetConfig {
+                target: "kimi-vscode-fork".into(),
+                accounts: Vec::new(),
+            }],
+        };
+        config.save(&paths.acp_config_file()).unwrap();
+
+        let scope = account_scope_for_target(&paths, "kimi-vscode-fork", &[]).unwrap();
+        assert_eq!(
+            scope,
+            AccountScope::AllExcept(HashSet::from(["account-cli".into()]))
+        );
+        let selected =
+            accounts_for_target(vec![account("account-cli"), account("account-acp")], &scope);
+        assert_eq!(selected[0].id.0, "account-acp");
+    }
+
+    #[test]
+    fn account_lease_is_exclusive_and_reusable_after_drop() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+        };
+        let first = acquire_account_lease(&paths, "account-a").unwrap();
+        assert!(acquire_account_lease(&paths, "account-a").is_err());
+        drop(first);
+        assert!(acquire_account_lease(&paths, "account-a").is_ok());
+    }
+
+    #[test]
+    fn named_targets_allow_parallel_instances_but_reject_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+        };
+        let vscode = InstanceLock::acquire(
+            &paths.router_lock_file_for_target("vscode-fork"),
+            "vscode conflict",
+        )
+        .unwrap();
+        let zed = InstanceLock::acquire(&paths.router_lock_file_for_target("zed"), "zed conflict")
+            .unwrap();
+        assert!(InstanceLock::acquire(
+            &paths.router_lock_file_for_target("vscode-fork"),
+            "vscode conflict",
+        )
+        .is_err());
+        drop((vscode, zed));
+    }
+
+    #[test]
+    fn cli_accepts_repeated_account_scope() {
+        let cli = Cli::try_parse_from([
+            "kimi-subscription-router",
+            "--target",
+            "kimi-vscode-fork",
+            "--account",
+            "account-a",
+            "--account",
+            "account-b",
+        ])
+        .unwrap();
+        assert_eq!(cli.target, "kimi-vscode-fork");
+        assert_eq!(cli.accounts, ["account-a", "account-b"]);
     }
 
     #[test]

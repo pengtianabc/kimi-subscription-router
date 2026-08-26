@@ -5,13 +5,13 @@
 
 use std::fs;
 use std::io::{Cursor, Read as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{sync_channel, Sender};
 use std::time::Duration;
 
 use anyhow::Context as _;
 use kimi_switch_core::paths::AppPaths;
-use kimi_switch_core::router_status::load_router_status_from;
+use kimi_switch_core::router_status::load_router_status;
 use rand::rngs::OsRng;
 use rand::RngCore as _;
 use serde::{Deserialize, Serialize};
@@ -102,13 +102,12 @@ pub fn start(paths: &AppPaths, requests: Sender<Request>) -> anyhow::Result<Info
         .map_err(|error| anyhow::anyhow!("启动本地控制服务失败: {error}"))?;
     let base_url = format!("http://{}/v1", server.server_addr());
     write_endpoint(&paths.control_endpoint_file(), &base_url)?;
-    let router_state = paths.router_state_file();
-    let router_lock = paths.router_lock_file();
+    let router_paths = paths.clone();
 
     let thread_token = token.clone();
     std::thread::Builder::new()
         .name("kimi-router-control".into())
-        .spawn(move || serve(server, thread_token, requests, router_state, router_lock))
+        .spawn(move || serve(server, thread_token, requests, router_paths))
         .context("启动本地控制服务线程失败")?;
 
     Ok(Info {
@@ -117,21 +116,14 @@ pub fn start(paths: &AppPaths, requests: Sender<Request>) -> anyhow::Result<Info
     })
 }
 
-fn serve(
-    server: Server,
-    token: String,
-    requests: Sender<Request>,
-    router_state: PathBuf,
-    router_lock: PathBuf,
-) {
+fn serve(server: Server, token: String, requests: Sender<Request>, router_paths: AppPaths) {
     for request in server.incoming_requests() {
         let token = token.clone();
         let requests = requests.clone();
-        let router_state = router_state.clone();
-        let router_lock = router_lock.clone();
+        let router_paths = router_paths.clone();
         let _ = std::thread::Builder::new()
             .name("kimi-router-control-request".into())
-            .spawn(move || handle(request, &token, &requests, &router_state, &router_lock));
+            .spawn(move || handle(request, &token, &requests, &router_paths));
     }
 }
 
@@ -139,8 +131,7 @@ fn handle(
     mut request: HttpRequest,
     token: &str,
     requests: &Sender<Request>,
-    router_state: &Path,
-    router_lock: &Path,
+    router_paths: &AppPaths,
 ) {
     if request.method() == &Method::Options {
         respond_json(request, 204, serde_json::json!({}));
@@ -163,11 +154,7 @@ fn handle(
     }
 
     if request.method() == &Method::Get && path == "/v1/events" {
-        respond_events(
-            request,
-            router_state.to_path_buf(),
-            router_lock.to_path_buf(),
-        );
+        respond_events(request, router_paths.clone());
         return;
     }
 
@@ -178,7 +165,7 @@ fn handle(
         && (matches!(path.as_str(), "/v1/router/status" | "/v1/router/sessions")
             || requested_session.is_some())
     {
-        match load_router_status_from(router_state, router_lock) {
+        match load_router_status(router_paths) {
             Ok(status) if path == "/v1/router/status" => {
                 respond_json(request, 200, serde_json::json!({"router": status}));
             }
@@ -366,8 +353,8 @@ fn respond_json(request: HttpRequest, status: u16, value: serde_json::Value) {
     let _ = request.respond(response);
 }
 
-fn respond_events(request: HttpRequest, state_path: PathBuf, lock_path: PathBuf) {
-    let stream = RouterEventStream::new(state_path, lock_path);
+fn respond_events(request: HttpRequest, paths: AppPaths) {
+    let stream = RouterEventStream::new(paths);
     let headers = [
         ("Content-Type", "text/event-stream; charset=utf-8"),
         ("Cache-Control", "no-store"),
@@ -382,18 +369,16 @@ fn respond_events(request: HttpRequest, state_path: PathBuf, lock_path: PathBuf)
 }
 
 struct RouterEventStream {
-    state_path: PathBuf,
-    lock_path: PathBuf,
+    paths: AppPaths,
     pending: Cursor<Vec<u8>>,
     previous: Option<String>,
     first: bool,
 }
 
 impl RouterEventStream {
-    fn new(state_path: PathBuf, lock_path: PathBuf) -> Self {
+    fn new(paths: AppPaths) -> Self {
         Self {
-            state_path,
-            lock_path,
+            paths,
             pending: Cursor::new(Vec::new()),
             previous: None,
             first: true,
@@ -405,7 +390,7 @@ impl RouterEventStream {
             std::thread::sleep(Duration::from_secs(2));
         }
         self.first = false;
-        let next = match load_router_status_from(&self.state_path, &self.lock_path) {
+        let next = match load_router_status(&self.paths) {
             Ok(status) => serde_json::to_string(&serde_json::json!({
                 "type": "router-status",
                 "router": status,
@@ -575,10 +560,10 @@ mod tests {
     #[test]
     fn event_stream_starts_with_router_snapshot() {
         let temp = tempfile::tempdir().unwrap();
-        let state = temp.path().join("router-state.json");
-        let lock = temp.path().join("router.lock");
-        std::fs::write(&state, r#"{"version":1,"sessions":{}}"#).unwrap();
-        let mut stream = RouterEventStream::new(state, lock);
+        let paths = test_paths(temp.path());
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(paths.router_state_file(), r#"{"version":1,"sessions":{}}"#).unwrap();
+        let mut stream = RouterEventStream::new(paths);
         let mut output = [0_u8; 2048];
         let count = stream.read(&mut output).unwrap();
         let event = String::from_utf8_lossy(&output[..count]);

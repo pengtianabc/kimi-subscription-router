@@ -161,7 +161,8 @@ fn select_from(
         })
 }
 
-fn routing_enabled(account: &Account) -> bool {
+/// 账号是否允许进入任意 ACP 目标的候选池。
+pub fn routing_enabled(account: &Account) -> bool {
     !account.manual_only()
         && account
             .extra

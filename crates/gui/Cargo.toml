@@ -19,6 +19,7 @@ kimi-switch-kimi.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+jsonc-parser.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 chrono.workspace = true
@@ -31,6 +32,7 @@ webbrowser = "1"
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 tray-icon = { version = "0.24", default-features = false }
 auto-launch = "0.6"
+rfd.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
 raw-window-handle = "0.6"

@@ -12,11 +12,12 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::paths::AppPaths;
+use crate::paths::{valid_router_target, AppPaths};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionAssignment {
+    pub target: String,
     pub session_id: String,
     pub account_id: String,
     pub assigned_at: DateTime<Utc>,
@@ -29,6 +30,15 @@ pub struct RouterStatusSnapshot {
     pub session_count: usize,
     pub account_session_counts: BTreeMap<String, usize>,
     pub sessions: Vec<SessionAssignment>,
+    pub targets: Vec<RouterTargetSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RouterTargetSnapshot {
+    pub target: String,
+    pub running: bool,
+    pub session_count: usize,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -44,12 +54,46 @@ struct PersistedOwner {
 }
 
 pub fn load_router_status(paths: &AppPaths) -> Result<RouterStatusSnapshot> {
-    load_router_status_from(&paths.router_state_file(), &paths.router_lock_file())
+    let mut combined = load_router_status_for_target(
+        &paths.router_state_file(),
+        &paths.router_lock_file(),
+        "default",
+    )?;
+    let targets_dir = paths.state_dir.join("router-targets");
+    let entries = match std::fs::read_dir(&targets_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(combined),
+        Err(error) => return Err(error.into()),
+    };
+    let mut targets = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|target| valid_router_target(target) && target != "default")
+        .collect::<Vec<_>>();
+    targets.sort();
+    for target in targets {
+        let status = load_router_status_for_target(
+            &paths.router_state_file_for_target(&target),
+            &paths.router_lock_file_for_target(&target),
+            &target,
+        )?;
+        merge_router_status(&mut combined, status);
+    }
+    Ok(combined)
 }
 
 pub fn load_router_status_from(
     state_path: &Path,
     lock_path: &Path,
+) -> Result<RouterStatusSnapshot> {
+    load_router_status_for_target(state_path, lock_path, "default")
+}
+
+pub fn load_router_status_for_target(
+    state_path: &Path,
+    lock_path: &Path,
+    target: &str,
 ) -> Result<RouterStatusSnapshot> {
     let persisted = match std::fs::read_to_string(state_path) {
         Ok(raw) if raw.trim().is_empty() => PersistedState::default(),
@@ -67,6 +111,7 @@ pub fn load_router_status_from(
                 .entry(owner.account_id.clone())
                 .or_insert(0) += 1;
             SessionAssignment {
+                target: target.to_string(),
                 session_id,
                 account_id: owner.account_id,
                 assigned_at: owner.assigned_at,
@@ -74,12 +119,37 @@ pub fn load_router_status_from(
         })
         .collect::<Vec<_>>();
 
+    let running = lock_is_held(lock_path)?;
+    let session_count = sessions.len();
     Ok(RouterStatusSnapshot {
-        running: lock_is_held(lock_path)?,
+        running,
         session_count: sessions.len(),
         account_session_counts,
         sessions,
+        targets: vec![RouterTargetSnapshot {
+            target: target.to_string(),
+            running,
+            session_count,
+        }],
     })
+}
+
+fn merge_router_status(combined: &mut RouterStatusSnapshot, mut status: RouterStatusSnapshot) {
+    combined.running |= status.running;
+    combined.session_count += status.session_count;
+    for (account_id, count) in status.account_session_counts {
+        *combined
+            .account_session_counts
+            .entry(account_id)
+            .or_default() += count;
+    }
+    combined.sessions.append(&mut status.sessions);
+    combined.targets.append(&mut status.targets);
+    combined.sessions.sort_by(|left, right| {
+        left.target
+            .cmp(&right.target)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
 }
 
 fn lock_is_held(path: &Path) -> Result<bool> {
@@ -142,6 +212,7 @@ mod tests {
         assert!(!status.running);
         assert_eq!(status.session_count, 3);
         assert_eq!(status.account_session_counts.get("a"), Some(&2));
+        assert_eq!(status.sessions[0].target, "default");
         assert_eq!(status.sessions[0].session_id, "session-a");
     }
 
@@ -156,5 +227,37 @@ mod tests {
         let status = load_router_status_from(&state, &lock).unwrap();
         assert!(status.running);
         FileExt::unlock(&held).unwrap();
+    }
+
+    #[test]
+    fn aggregates_named_router_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_dir: temp.path().join("config"),
+            data_dir: temp.path().join("data"),
+            state_dir: temp.path().join("state"),
+            cache_dir: temp.path().join("cache"),
+        };
+        std::fs::create_dir_all(paths.state_dir.join("router-targets/vscode-fork")).unwrap();
+        std::fs::write(
+            paths.router_state_file(),
+            r#"{"version":1,"sessions":{"default-session":{"account_id":"a","assigned_at":"2026-08-18T00:00:00Z"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            paths.router_state_file_for_target("vscode-fork"),
+            r#"{"version":1,"sessions":{"fork-session":{"account_id":"b","assigned_at":"2026-08-18T00:00:00Z"}}}"#,
+        )
+        .unwrap();
+
+        let status = load_router_status(&paths).unwrap();
+        assert_eq!(status.session_count, 2);
+        assert_eq!(status.targets.len(), 2);
+        assert_eq!(status.account_session_counts.get("a"), Some(&1));
+        assert_eq!(status.account_session_counts.get("b"), Some(&1));
+        assert!(status
+            .sessions
+            .iter()
+            .any(|session| session.target == "vscode-fork"));
     }
 }

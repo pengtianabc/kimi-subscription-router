@@ -30,6 +30,7 @@ Kimi Subscription Router 是一款面向 [Kimi Code](https://www.kimi.com/) 用�
 - 给账号设置别名和订阅到期日备注。
 - 搜索账号，并显示账号名称、掩码邮箱、会员等级和路由会话数。
 - 为每个账号单独设置是否参与 ACP 自动路由。
+- 在 App 中划分 Kimi CLI 保留账号与多个 ACP target 的互斥账号池，并写入 VS Code 工作区配置。
 - 支持深色、浅色主题，并在重启后保留选择。
 - 关闭或最小化窗口后驻留 Windows 系统托盘或 macOS 菜单栏。
 - 可在状态栏菜单中设置开机启动和自动刷新间隔。
@@ -155,7 +156,34 @@ open "target/release/Kimi Subscription Router.app"
 - 账号耗尽或停止参与路由时，可以恢复到其他可用账号。
 - 每个账号使用独立的 Kimi Code 运行目录和 OAuth 文件。
 
-在 GUI 中添加账号并勾选 **参与路由**，然后将 ACP 客户端的自定义 agent command 设置为 `kimi-subscription-router` 的绝对路径。详细配置、状态文件和限制见 [ACP 路由文档](docs/ACP-ROUTER.md)。
+在 GUI 中添加账号并勾选 **参与路由**，然后点击工具栏的 **ACP**：
+
+1. 在 **Kimi CLI 保留账号** 中选择只供官方 CLI 使用的账号。
+2. 为每个 ACP 客户端新建一个 target，并勾选专用账号池；CLI 保留池和各 target 之间均不能重叠。
+3. VS Code 用户可通过目录选择按钮指定工作区，点击 **保存并写入 VS Code**。App 会记住
+   最近一次工作区，并合并写入 `<工作区>/.vscode/settings.json`，其他 VS Code 设置保持不变。
+
+其他 ACP 客户端可把自定义 agent command 设置为 `kimi-subscription-router --target <target>`。
+详细配置、状态文件和限制见 [ACP 路由文档](docs/ACP-ROUTER.md)。
+
+多个 ACP 客户端应使用不同目标名，并显式分配互不重叠的账号池：
+
+```bash
+kimi-subscription-router --target zed --account <账号A> --account <账号B>
+kimi-subscription-router --target jetbrains --account <账号C>
+```
+
+同一目标内可配置多个账号做额度路由和故障转移；不同目标拥有独立的进程锁、会话目录和
+owner 状态。同一账号有全局 ACP 租约，不能同时进入两个目标。App 中保留给 Kimi CLI 的
+账号不会进入隐式 ACP 账号池；显式 `--account` 仍是高级覆盖入口。官方 CLI 本身不识别
+路由器锁，因此直接在官方 CLI 中重新登录到 ACP 账号会绕过 App 分配。未勾选
+**参与路由** 的账号即使出现在 `--account` 中也不会启动 `kimi acp` 子进程。
+
+路由器未收到显式 `--account` 时，会按 `--target` 读取 App 保存的
+`acp-targets.toml`。显式 `--account` 仍然优先，便于脚本或不使用 App 配置的客户端接入。
+
+[`gxgleo67/kimi-code-vscode-fork`](https://github.com/gxgleo67/kimi-code-vscode-fork) 已增加 external ACP backend，
+将它接到本路由器。插件 external 模式会把账号选择留给路由器，不会静默回退到另一套内嵌账号。
 
 ## 命令行（可选）
 

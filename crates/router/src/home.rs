@@ -35,11 +35,22 @@ impl AccountHome {
 
         let credential_file = path.join("credentials").join("kimi-code.json");
         if credential_file.exists() {
-            let raw = fs::read_to_string(&credential_file)
+            let isolated = fs::read_to_string(&credential_file)
                 .with_context(|| format!("read {}", credential_file.display()))?;
-            provider
-                .absorb_blob(&account.id, &raw)
-                .context("absorb credentials rotated by Kimi Code")?;
+            match provider.export_blob(&account.id) {
+                Ok(stored) if isolated_credentials_are_newer(&isolated, &stored) => {
+                    provider
+                        .absorb_blob(&account.id, &isolated)
+                        .context("absorb credentials rotated by Kimi Code")?;
+                }
+                Ok(stored) => write_private(&credential_file, stored.as_bytes())?,
+                Err(_) => {
+                    // 账号库副本缺失时，保留原有异常退出恢复路径。
+                    provider
+                        .absorb_blob(&account.id, &isolated)
+                        .context("recover credentials left by Kimi Code")?;
+                }
+            }
         } else {
             let raw = provider
                 .export_blob(&account.id)
@@ -60,6 +71,12 @@ impl AccountHome {
     pub fn absorb_credentials(&self, provider: &Arc<KimiProvider>) -> Result<()> {
         let raw = fs::read_to_string(&self.credential_file)
             .with_context(|| format!("read {}", self.credential_file.display()))?;
+        if provider
+            .export_blob(&AccountId(self.account_id.clone()))
+            .is_ok_and(|stored| !isolated_credentials_are_newer(&raw, &stored))
+        {
+            return Ok(());
+        }
         provider
             .absorb_blob(&AccountId(self.account_id.clone()), &raw)
             .context("persist credentials rotated by Kimi Code")
@@ -75,6 +92,20 @@ impl AccountHome {
             }
         }
     }
+}
+
+/// 仅在隔离进程拿到更晚的官方 token 时回灌，避免跨 ACP 目标恢复旧 refresh token。
+fn isolated_credentials_are_newer(isolated: &str, stored: &str) -> bool {
+    credential_expiry(isolated)
+        .zip(credential_expiry(stored))
+        .is_some_and(|(isolated, stored)| isolated > stored)
+}
+
+fn credential_expiry(raw: &str) -> Option<i64> {
+    let value = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    value
+        .get("expires_at")
+        .and_then(|expiry| expiry.as_i64().or_else(|| expiry.as_str()?.parse().ok()))
 }
 
 /// 只复制官方 Kimi OAuth provider 所需配置，过滤自定义端点与内联密钥。
@@ -330,5 +361,15 @@ model = "evil"
         home.purge_credentials().unwrap();
         home.purge_credentials().unwrap();
         assert!(!credential_file.exists());
+    }
+
+    #[test]
+    fn only_newer_isolated_credentials_replace_the_store_copy() {
+        let old = r#"{"expires_at":100,"refresh_token":"old"}"#;
+        let new = r#"{"expires_at":200,"refresh_token":"new"}"#;
+        assert!(isolated_credentials_are_newer(new, old));
+        assert!(!isolated_credentials_are_newer(old, new));
+        assert!(!isolated_credentials_are_newer(new, new));
+        assert!(!isolated_credentials_are_newer("{}", old));
     }
 }
