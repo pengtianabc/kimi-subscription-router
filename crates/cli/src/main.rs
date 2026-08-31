@@ -391,10 +391,16 @@ fn fmt_window(quotas: &[Quota], window: QuotaWindow) -> String {
     }
 }
 
-/// 选出「当前最值得用」的账号下标：短窗口（5h）剩余优先，其次长窗口（7d）剩余，
-/// 再按 priority、id 兜底。短窗口耗尽（不可用）的账号不参与。返回 None 表示没有可用账号。
+/// 选出「当前最值得用」的账号下标。筛选与排序规则：
+///
+/// - 短窗口（5h）必须仍有剩余，否则不可用、不参与；
+/// - 长窗口（7d）已耗尽（used≈100%）的账号排到最后——即便 5h 还有剩余，
+///   7d 用光也基本干不了活，不应作为首选；
+/// - 其余按 5h 剩余降序、7d 剩余降序、priority 升序、id 升序排序。
+///
+/// 返回 None 表示没有可用账号。
 fn compute_recommend(rows: &[Row]) -> Option<usize> {
-    let mut cands: Vec<(f64, f64, i32, String, usize)> = Vec::new();
+    let mut cands: Vec<(bool, f64, f64, i32, String, usize)> = Vec::new();
     for (i, row) in rows.iter().enumerate() {
         let Some(quotas) = row.quotas() else {
             continue;
@@ -407,21 +413,29 @@ fn compute_recommend(rows: &[Row]) -> Option<usize> {
         if short_rem <= 0.0 {
             continue; // 短窗口耗尽，不可用
         }
-        let long_rem = quotas
+        let (long_rem, long_exhausted) = quotas
             .iter()
             .find(|q| q.window == QuotaWindow::SevenDay)
-            .and_then(|q| q.usage_ratio().map(|r| 1.0 - r))
-            .unwrap_or(0.0);
-        cands.push((short_rem, long_rem, row.account.priority, row.account.id.0.clone(), i));
+            .and_then(|q| q.usage_ratio())
+            .map(|r| (1.0 - r, r >= 1.0))
+            .unwrap_or((0.0, false));
+        cands.push((
+            long_exhausted,
+            short_rem,
+            long_rem,
+            row.account.priority,
+            row.account.id.0.clone(),
+            i,
+        ));
     }
     cands.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-            .then(a.2.cmp(&b.2))
-            .then(a.3.cmp(&b.3))
+        a.0.cmp(&b.0) // 7d 耗尽的排后面
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)) // 5h 剩余降序
+            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)) // 7d 剩余降序
+            .then(a.3.cmp(&b.3)) // priority 升序
+            .then(a.4.cmp(&b.4)) // id 升序
     });
-    cands.first().map(|c| c.4)
+    cands.first().map(|c| c.5)
 }
 
 /// 是否所有账号的 7d 窗口都已耗尽（用于底部警告）。
@@ -444,7 +458,7 @@ fn all_seven_day_exhausted(rows: &[Row]) -> bool {
 fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
     // 列宽已含两侧内边距（每列 ` content ` 占 width 列）。
     const WIDTHS: [usize; 6] = [4, 5, 40, 8, 8, 12];
-    const HEADERS: [&str; 6] = ["#", "NOW", "ACCOUNT", "5H", "7D", "RECOMMEND"];
+    const HEADERS: [&str; 6] = ["#", "ON", "ACCOUNT", "5H", "7D", "RECOMMEND"];
 
     let header_line: String = {
         let mut s = String::from("|");
