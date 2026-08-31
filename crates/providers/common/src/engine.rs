@@ -482,6 +482,18 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
         let (account, access) = self.account_with_fresh_access(id).await?;
         self.runtime.fetch_account_profile(&access, &account).await
     }
+
+    /// 一次取配额 + 账号资料，共用同一份 access token（parked 账号只刷新一次）。
+    /// 比分别调 `query_quota` + `query_account_profile` 省一次 refresh。
+    pub async fn fetch_quota_and_profile(
+        &self,
+        id: &AccountId,
+    ) -> Result<(Vec<Quota>, AccountProfile)> {
+        let (account, access) = self.account_with_fresh_access(id).await?;
+        let quota = self.runtime.fetch_quota(&access, &account).await?;
+        let profile = self.runtime.fetch_account_profile(&access, &account).await?;
+        Ok((quota, profile))
+    }
 }
 
 #[async_trait]

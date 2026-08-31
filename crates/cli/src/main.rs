@@ -19,8 +19,8 @@ use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    settings, Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore,
-    FileStore, KeyringStore, Provider, Quota, QuotaCache, QuotaWindow, RemovedAccounts,
+    settings, Account, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
+    KeyringStore, Provider, Quota, QuotaCache, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
 
@@ -191,6 +191,7 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// 单个账号的额度查询结果。
+#[derive(Clone)]
 enum QuotaOutcome {
     Ready(Vec<Quota>),
     /// 查询失败但有仍有效的旧缓存。
@@ -198,9 +199,42 @@ enum QuotaOutcome {
     Failed(String),
 }
 
-/// 拉齐本地激活账号 + 列出账号 + 并发查额度（带缓存节流）。返回 (账号, 额度结果) 列表，
-/// 供默认 `status` 与 `list` 共用，避免重复网络/缓存逻辑。
-async fn gather(ctx: &AppContext) -> Result<Vec<(Account, Option<QuotaOutcome>)>> {
+/// 账号资料里对用户可读的字段（来自 Provider profile 接口）。
+#[derive(Clone)]
+struct ProfileView {
+    email: Option<String>,
+    display_label: Option<String>,
+}
+
+/// `gather` 的一行：账号 + 额度 + 资料。
+struct Row {
+    account: Account,
+    quota: Option<QuotaOutcome>,
+    profile: Option<ProfileView>,
+}
+
+impl Row {
+    /// 取当前有效的额度列表（仅 Ready/Stale 有）。
+    fn quotas(&self) -> Option<&[Quota]> {
+        match &self.quota {
+            Some(QuotaOutcome::Ready(q)) | Some(QuotaOutcome::Stale(q)) => Some(q),
+            _ => None,
+        }
+    }
+
+    /// 用于表格展示的用户名：优先 email，其次 display_label，再回落 label。
+    fn display_name(&self) -> String {
+        self.profile
+            .as_ref()
+            .and_then(|p| p.email.clone())
+            .or_else(|| self.profile.as_ref().and_then(|p| p.display_label.clone()))
+            .unwrap_or_else(|| self.account.label.clone())
+    }
+}
+
+/// 拉齐本地激活账号 + 列出账号 + 并发查额度与资料（带缓存节流）。
+/// 返回 `Row` 列表，供默认 `status`、`list` 与 `auto` 共用。
+async fn gather(ctx: &AppContext) -> Result<Vec<Row>> {
     // 1. 自动导入/对齐本地激活账号（`rm` 过的账号有墓碑，跳过）。
     sync_local_active(ctx);
 
@@ -210,17 +244,17 @@ async fn gather(ctx: &AppContext) -> Result<Vec<(Account, Option<QuotaOutcome>)>
         return Ok(Vec::new());
     }
 
-    // 3. 并发查额度（缓存节流 + 失败退避，避免高频打 usage 端点）。
+    // 3. 并发查额度 + 资料（缓存节流 + 失败退避，避免高频打 usage 端点）。
     let cache_path = AppPaths::resolve()?.quota_cache_file();
     let mut cache = QuotaCache::load(&cache_path);
     let quota_cfg = settings::current().quota.clone();
     let min_refresh = Duration::from_millis(quota_cfg.min_refresh_interval_ms);
     let backoff_cap = Duration::from_millis(quota_cfg.failure_backoff_max_ms);
 
-    let mut outcomes: Vec<Option<QuotaOutcome>> = Vec::with_capacity(accounts.len());
+    let mut outcomes: Vec<Option<QuotaOutcome>> = vec![None; accounts.len()];
+    let mut profiles: Vec<Option<ProfileView>> = vec![None; accounts.len()];
     let mut jobs = Vec::new();
     for (idx, account) in accounts.iter().enumerate() {
-        outcomes.push(None);
         if let Some(entry) = cache.fresh("kimi", &account.id.0, min_refresh) {
             outcomes[idx] = Some(QuotaOutcome::Ready(entry.quotas));
             continue;
@@ -244,18 +278,21 @@ async fn gather(ctx: &AppContext) -> Result<Vec<(Account, Option<QuotaOutcome>)>
     for (idx, id) in jobs {
         let kimi = ctx.kimi.clone();
         handles.push(tokio::spawn(async move {
-            let result = kimi_switch_core::query_quota_with_retry(kimi.as_ref(), &id)
-                .await
-                .map_err(|e| e.to_string());
+            // 一次拿配额 + 资料，parked 账号只刷新一次 access token。
+            let result = kimi.fetch_quota_and_profile(&id).await.map_err(|e| e.to_string());
             (idx, id, result)
         }));
     }
     for handle in handles {
         let (idx, id, result) = handle.await?;
         match result {
-            Ok(quotas) => {
+            Ok((quotas, profile)) => {
                 cache.set("kimi", &id.0, quotas.clone());
                 outcomes[idx] = Some(QuotaOutcome::Ready(quotas));
+                profiles[idx] = Some(ProfileView {
+                    email: profile.email,
+                    display_label: profile.display_label,
+                });
             }
             Err(error) => {
                 cache.record_failure("kimi", &id.0, &error);
@@ -270,22 +307,148 @@ async fn gather(ctx: &AppContext) -> Result<Vec<(Account, Option<QuotaOutcome>)>
     }
     cache.save(&cache_path);
 
-    Ok(accounts.into_iter().zip(outcomes).collect())
+    Ok(accounts
+        .into_iter()
+        .enumerate()
+        .map(|(i, a)| Row {
+            account: a,
+            quota: std::mem::take(&mut outcomes[i]),
+            profile: std::mem::take(&mut profiles[i]),
+        })
+        .collect())
 }
 
-/// 把 (账号, 额度结果) 渲染成人类可读表格（与默认入口一致）。
-fn render_rows(rows: &[(Account, Option<QuotaOutcome>)]) {
-    println!("kimi");
-    for (idx, (account, outcome)) in rows.iter().enumerate() {
-        let n = idx + 1;
-        let star = if account.active { "*" } else { " " };
-        let quota_text = match outcome {
-            Some(QuotaOutcome::Ready(quotas)) => format_quotas(quotas),
-            Some(QuotaOutcome::Stale(quotas)) => format!("{} (stale)", format_quotas(quotas)),
-            Some(QuotaOutcome::Failed(error)) => format!("quota: {error}"),
-            None => "quota: n/a".to_string(),
+/// 截断到 `n` 个字符（按 Unicode 码点），避免中文邮箱撑破表格列宽。
+fn truncate(s: &str, n: usize) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if out.chars().count() >= n {
+            break;
+        }
+        out.push(ch);
+    }
+    if out.chars().count() < s.chars().count() {
+        out.push('…');
+    }
+    out
+}
+
+/// 渲染某个窗口的额度：`used/limit pct%`；缺失则 `n/a`。
+fn fmt_window(quotas: &[Quota], window: QuotaWindow) -> String {
+    match quotas.iter().find(|q| q.window == window) {
+        Some(q) => match q.usage_ratio() {
+            Some(r) => format!("{}/{} {:.0}%", q.used, q.limit, r * 100.0),
+            None => format!("{}/{}", q.used, q.limit),
+        },
+        None => "n/a".to_string(),
+    }
+}
+
+/// 选出「当前最值得用」的账号下标：短窗口（5h）剩余优先，其次长窗口（7d）剩余，
+/// 再按 priority、id 兜底。短窗口耗尽（不可用）的账号不参与。返回 None 表示没有可用账号。
+fn compute_recommend(rows: &[Row]) -> Option<usize> {
+    let mut cands: Vec<(f64, f64, i32, String, usize)> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let Some(quotas) = row.quotas() else {
+            continue;
         };
-        println!("  {star} {n:>2}  {:<24} {quota_text}", account.id);
+        let short_rem = quotas
+            .iter()
+            .find(|q| q.window == QuotaWindow::FiveHour)
+            .and_then(|q| q.usage_ratio().map(|r| 1.0 - r))
+            .unwrap_or(0.0);
+        if short_rem <= 0.0 {
+            continue; // 短窗口耗尽，不可用
+        }
+        let long_rem = quotas
+            .iter()
+            .find(|q| q.window == QuotaWindow::SevenDay)
+            .and_then(|q| q.usage_ratio().map(|r| 1.0 - r))
+            .unwrap_or(0.0);
+        cands.push((short_rem, long_rem, row.account.priority, row.account.id.0.clone(), i));
+    }
+    cands.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    });
+    cands.first().map(|c| c.4)
+}
+
+/// 是否所有账号的 7d 窗口都已耗尽（用于底部警告）。
+fn all_seven_day_exhausted(rows: &[Row]) -> bool {
+    !rows.is_empty()
+        && rows.iter().all(|row| match row.quotas() {
+            Some(q) => q
+                .iter()
+                .find(|qq| qq.window == QuotaWindow::SevenDay)
+                .and_then(|qq| qq.usage_ratio())
+                .map(|r| r >= 1.0)
+                .unwrap_or(false),
+            None => false,
+        })
+}
+
+/// 渲染对齐表格：编号 / 当前 / 用户名 / 5h / 7d / recommend，底部给结论。
+fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
+    println!(
+        "{:<3} {:<4} {:<30} {:<14} {:<14} RECOMMEND",
+        "#", "NOW", "ACCOUNT", "5H", "7D"
+    );
+    println!("{}", "-".repeat(74));
+    for (idx, row) in rows.iter().enumerate() {
+        let n = idx + 1;
+        let now = if row.account.active { "*" } else { " " };
+        let name = row.display_name();
+        let name_disp = if name == row.account.id.0 {
+            name
+        } else {
+            format!("{name} ({})", row.account.id.0)
+        };
+        let name_field = truncate(&name_disp, 28);
+        let err = match &row.quota {
+            Some(QuotaOutcome::Failed(e)) => Some(e.as_str()),
+            _ => None,
+        };
+        let (h5, d7) = if let Some(e) = err {
+            (truncate(e, 13), "—".to_string())
+        } else {
+            let q = row.quotas();
+            (
+                q.map(|x| fmt_window(x, QuotaWindow::FiveHour))
+                    .unwrap_or_else(|| "n/a".into()),
+                q.map(|x| fmt_window(x, QuotaWindow::SevenDay))
+                    .unwrap_or_else(|| "n/a".into()),
+            )
+        };
+        let rec = if Some(idx) == recommend_idx { "← use" } else { "" };
+        println!(
+            "{:<3} {:<4} {:<30} {:<14} {:<14} {}",
+            n, now, name_field, h5, d7, rec
+        );
+    }
+
+    println!();
+    match recommend_idx {
+        Some(i) => {
+            let row = &rows[i];
+            let seven_gone = row
+                .quotas()
+                .and_then(|q| q.iter().find(|q| q.window == QuotaWindow::SevenDay))
+                .and_then(|q| q.usage_ratio())
+                .map(|r| r >= 1.0)
+                .unwrap_or(false);
+            let note = if seven_gone { " (7d exhausted)" } else { "" };
+            println!("recommend: kimi/{} {}{}", row.account.id, row.display_name(), note);
+            if all_seven_day_exhausted(rows) {
+                println!("⚠ all accounts' 7d quota is exhausted; only 5h remains available");
+            }
+        }
+        None => {
+            println!("no account has remaining 5h quota; all are exhausted or unknown");
+        }
     }
 }
 
@@ -295,11 +458,11 @@ async fn status(ctx: &AppContext) -> Result<()> {
         println!("No accounts. Sign in to Kimi Code, then run `kimi-switch login kimi`.");
         return Ok(());
     }
-    render_rows(&rows);
+    render_table(&rows, compute_recommend(&rows));
     Ok(())
 }
 
-/// `list` 子命令：复用 `gather` 的账号 + 额度数据。`--json` 输出机器可读 JSON（供 GUI/工具读取）。
+/// `list` 子命令：复用 `gather` 的账号 + 额度 + 资料数据。`--json` 输出机器可读 JSON。
 async fn list(ctx: &AppContext, json: bool) -> Result<()> {
     let rows = gather(ctx).await?;
     if rows.is_empty() {
@@ -311,13 +474,15 @@ async fn list(ctx: &AppContext, json: bool) -> Result<()> {
         return Ok(());
     }
     if !json {
-        render_rows(&rows);
+        render_table(&rows, compute_recommend(&rows));
         return Ok(());
     }
+    let rec_idx = compute_recommend(&rows);
     let items: Vec<serde_json::Value> = rows
         .iter()
-        .map(|(account, outcome)| {
-            let quotas: Vec<serde_json::Value> = match outcome {
+        .enumerate()
+        .map(|(i, row)| {
+            let quotas: Vec<serde_json::Value> = match &row.quota {
                 Some(QuotaOutcome::Ready(q)) | Some(QuotaOutcome::Stale(q)) => q
                     .iter()
                     .map(|q| {
@@ -334,13 +499,16 @@ async fn list(ctx: &AppContext, json: bool) -> Result<()> {
                 _ => Vec::new(),
             };
             serde_json::json!({
-                "id": account.id.0,
-                "label": account.label,
-                "active": account.active,
-                "priority": account.priority,
-                "manualOnly": account.manual_only(),
-                "routingEnabled": account.extra.get(EXTRA_ROUTING_ENABLED).and_then(|v| v.as_bool()),
-                "subscriptionExpiresOn": account.extra.get(EXTRA_SUBSCRIPTION_EXPIRES_ON).and_then(|v| v.as_str()),
+                "id": row.account.id.0,
+                "label": row.account.label,
+                "email": row.profile.as_ref().and_then(|p| p.email.clone()),
+                "displayLabel": row.profile.as_ref().and_then(|p| p.display_label.clone()),
+                "active": row.account.active,
+                "priority": row.account.priority,
+                "manualOnly": row.account.manual_only(),
+                "routingEnabled": row.account.extra.get(EXTRA_ROUTING_ENABLED).and_then(|v| v.as_bool()),
+                "subscriptionExpiresOn": row.account.extra.get(EXTRA_SUBSCRIPTION_EXPIRES_ON).and_then(|v| v.as_str()),
+                "recommend": Some(i) == rec_idx,
                 "quotas": quotas,
             })
         })
@@ -371,41 +539,6 @@ fn sync_local_active(ctx: &AppContext) {
             }
         }
         Err(e) => tracing::debug!(err=%e, "skip kimi auto-import"),
-    }
-}
-
-/// 把多窗口额度渲染成一行：`5h 18% (18/100) resets 08-15 20:52 · 7d 4% (4/100)`。
-fn format_quotas(quotas: &[Quota]) -> String {
-    if quotas.is_empty() {
-        return "quota: n/a".to_string();
-    }
-    let visible = quotas
-        .iter()
-        .filter(|q| q.window != QuotaWindow::Month)
-        .map(|q| {
-            let window = match q.window {
-                QuotaWindow::FiveHour => "5h",
-                QuotaWindow::SevenDay => "7d",
-                _ => "custom",
-            };
-            let pct = q
-                .usage_ratio()
-                .map(|r| format!("{:.0}%", r * 100.0))
-                .unwrap_or_else(|| "?".to_string());
-            let mut text = format!("{window} {pct} ({}/{})", q.used, q.limit);
-            if let Some(reset) = q.reset_at {
-                text.push_str(&format!(
-                    " resets {}",
-                    reset.with_timezone(&chrono::Local).format("%m-%d %H:%M")
-                ));
-            }
-            text
-        })
-        .collect::<Vec<_>>();
-    if visible.is_empty() {
-        "quota: n/a".to_string()
-    } else {
-        visible.join(" · ")
     }
 }
 
@@ -606,92 +739,54 @@ async fn set(
 // auto（自动切换：谁还有短窗口额度就切谁）
 // ---------------------------------------------------------------------------
 
-/// 自动切换：在「短窗口（5h）还有剩余额度」的账号里，选剩余最多者激活。
+/// 自动切换：选 `compute_recommend` 算出的「当前最值得用」的账号激活。
 ///
-/// 选择规则：
-/// - 排除 `manual_only` 账号（只手动激活）。
-/// - 只认有短窗口额度、且用量 < 100% 的账号（耗尽/未知一律不选，避免切到死号）。
-/// - 并列时按 priority 升序、再按 id 升序。当前已是该账号则不打扰。
+/// 选择规则（见 `compute_recommend`）：
+/// - 排除短窗口（5h）耗尽的账号（不可用）。
+/// - 优先短窗口剩余最多，其次长窗口（7d）剩余最多，再按 priority、id 兜底。
+/// - 当前已是该账号则不打扰。
 async fn auto(ctx: &AppContext, dry_run: bool) -> Result<()> {
     let rows = gather(ctx).await?;
     if rows.is_empty() {
         anyhow::bail!("no accounts; run `kimi-switch login kimi` first");
     }
 
-    struct Candidate {
-        id: String,
-        used_ratio: f64,
-        active: bool,
-        priority: i32,
-    }
-    let mut candidates: Vec<Candidate> = Vec::new();
-    for (account, outcome) in &rows {
-        if account.manual_only() {
-            continue;
-        }
-        let quotas = match outcome {
-            Some(QuotaOutcome::Ready(q)) | Some(QuotaOutcome::Stale(q)) => q,
-            _ => continue, // 未知/失败：保守不选
-        };
-        let Some(short) = quotas
-            .iter()
-            .find(|q| q.window == QuotaWindow::FiveHour)
-        else {
-            continue; // 该账号没有短窗口额度
-        };
-        let Some(ratio) = short.usage_ratio() else {
-            continue;
-        };
-        if ratio >= 1.0 {
-            continue; // 已耗尽
-        }
-        candidates.push(Candidate {
-            id: account.id.0.clone(),
-            used_ratio: ratio,
-            active: account.active,
-            priority: account.priority,
-        });
-    }
-
-    if candidates.is_empty() {
+    let Some(idx) = compute_recommend(&rows) else {
         anyhow::bail!(
             "no account has remaining short-window (5h) quota; all exhausted or unknown"
         );
-    }
-    candidates.sort_by(|a, b| {
-        a.used_ratio
-            .partial_cmp(&b.used_ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.priority.cmp(&b.priority))
-            .then(a.id.cmp(&b.id))
-    });
-    let best = &candidates[0];
+    };
+    let row = &rows[idx];
 
-    if best.active {
+    let short_used = row
+        .quotas()
+        .and_then(|q| q.iter().find(|q| q.window == QuotaWindow::FiveHour))
+        .and_then(|q| q.usage_ratio())
+        .map(|r| r * 100.0)
+        .unwrap_or(0.0);
+
+    if row.account.active {
         println!(
             "already on best account kimi/{} (5h used {:.0}%)",
-            best.id,
-            best.used_ratio * 100.0
+            row.account.id, short_used
         );
         return Ok(());
     }
     if dry_run {
         println!(
             "would swap → kimi/{} (5h used {:.0}%)",
-            best.id,
-            best.used_ratio * 100.0
+            row.account.id, short_used
         );
         return Ok(());
     }
 
-    let id = AccountId(best.id.clone());
+    let id = row.account.id.clone();
     ctx.kimi.activate(&id).await?;
     ctx.audit
-        .append(AuditEvent::ok("auto-activate", "kimi", Some(best.id.as_str())));
+        .append(AuditEvent::ok("auto-activate", "kimi", Some(id.0.as_str())));
     println!(
         "auto swap → kimi/{} (5h used {:.0}%)",
-        best.id,
-        best.used_ratio * 100.0
+        id, short_used
     );
     Ok(())
 }
