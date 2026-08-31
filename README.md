@@ -6,7 +6,7 @@
 
 Kimi Subscription Router 是一款面向 [Kimi Code](https://www.kimi.com/) 用户的非官方多账号管理工具，支持 Windows 和 macOS。
 
-当前版本：**0.1**（Cargo 版本 `0.1.0`）。
+当前版本：**0.2**（Cargo 版本 `0.2.0`）。
 
 它可以保存多个 Kimi Code 账号、查看 5 小时与 7 天额度、快速切换当前账号，并可选地把多个订阅接入同一个 ACP 入口。所有账号凭证只保存在当前电脑上。
 
@@ -35,6 +35,7 @@ Kimi Subscription Router 是一款面向 [Kimi Code](https://www.kimi.com/) 用�
 - 关闭或最小化窗口后驻留 Windows 系统托盘或 macOS 菜单栏。
 - 可在状态栏菜单中设置开机启动和自动刷新间隔。
 - 提供可选的命令行工具、本机控制 API 和多账号 ACP 路由器。
+- 命令行支持以表格查看每个账号的 5h/7d 额度与自动推荐，更新账号元数据（别名、优先级、路由开关、订阅到期日），并按 5h/7d 额度自动切换到最优账号。
 
 ## 安装
 
@@ -187,23 +188,32 @@ owner 状态。同一账号有全局 ACP 租约，不能同时进入两个目标
 
 ## 命令行（可选）
 
-macOS：
+macOS（开发构建的二进制名为 `kimi-switch-cli`，发布包中名为 `Kimi Subscription Router CLI`）：
 
 ```bash
-"./Kimi Subscription Router CLI"                   # 查看账号与额度
-"./Kimi Subscription Router CLI" login kimi        # 导入当前 Kimi Code 账号
-"./Kimi Subscription Router CLI" swap <编号或 ID>  # 切换账号
-"./Kimi Subscription Router CLI" rm <编号或 ID>    # 删除账号
+"./kimi-switch-cli"                                  # 查看账号与额度（表格）
+"./kimi-switch-cli" list                             # 等价于默认入口，渲染表格
+"./kimi-switch-cli" list --json                      # 输出机器可读 JSON
+"./kimi-switch-cli" login kimi                       # 导入当前 Kimi Code 账号
+"./kimi-switch-cli" swap <编号或 ID>                  # 切换账号
+"./kimi-switch-cli" set <编号或 ID> --label 别名 --priority 0 --routing-enabled true --subscription-expires-on 2026-09-30  # 更新账号元数据
+"./kimi-switch-cli" rm <编号或 ID>                    # 删除账号
+"./kimi-switch-cli" auto                             # 按额度自动切换到最优账号
+"./kimi-switch-cli" auto --dry-run                   # 只打印会切到的账号，不真正切换
 ```
 
-Windows PowerShell：
+Windows PowerShell（发布包中使用 `Kimi Subscription Router CLI.exe`，子命令相同）：
 
 ```powershell
-& ".\Kimi Subscription Router CLI.exe"                   # 查看账号与额度
-& ".\Kimi Subscription Router CLI.exe" login kimi        # 导入当前 Kimi Code 账号
-& ".\Kimi Subscription Router CLI.exe" swap <编号或 ID>  # 切换账号
-& ".\Kimi Subscription Router CLI.exe" rm <编号或 ID>    # 删除账号
+& ".\Kimi Subscription Router CLI.exe" list
+& ".\Kimi Subscription Router CLI.exe" auto --dry-run
 ```
+
+子命令说明：
+
+- `list` / 无参数：以表格展示每个账号的当前激活标记、用户名（优先显示邮箱或别名）、5 小时与 7 天额度已用百分比，并自动计算 `RECOMMEND` 列指出当前最值得使用的账号。带 `--json` 会输出含邮箱、`displayLabel` 与 `recommend` 字段的 JSON，便于脚本解析。
+- `set`：更新账号元数据。`--label` 设置别名；`--priority` 取值范围 -10000~10000，数值越小在自动切换中越优先；`--routing-enabled` 设置是否参与自动路由；`--subscription-expires-on` 记录订阅到期日（YYYY-MM-DD，传空串清除）。
+- `auto`：依据额度自动切换当前账号。筛选与排序规则为：5 小时窗口必须仍有剩余；7 天已耗尽（已用约 100%）的账号排到最后，即便 5h 还有剩余；其余按 5h 剩余降序、7d 剩余降序、priority 升序、id 升序选择。加 `--dry-run` 只预览不切换。
 
 GUI 和 CLI 使用同一份本机账号库，可以混合使用。
 
