@@ -348,7 +348,7 @@ fn pad_cell(s: &str, width: usize, align: Align) -> String {
         if w + 2 <= width {
             out.push('…');
             w += 2;
-        } else if w + 1 <= width {
+        } else if w < width {
             out.push('.');
             w += 1;
         }
@@ -362,6 +362,22 @@ fn pad_cell(s: &str, width: usize, align: Align) -> String {
         }
         Align::Right => format!("{}{}", " ".repeat(pad), out),
     }
+}
+
+/// 单元格：在 `width` 列宽内左右各留一个空格，即 ` content `（列宽已含两侧空格）。
+fn cell(content: &str, width: usize, align: Align) -> String {
+    format!(" {} ", pad_cell(content, width.saturating_sub(2), align))
+}
+
+/// 表格分隔行：`+----+----+...+`。
+fn sep_line(widths: &[usize]) -> String {
+    let mut s = String::new();
+    for w in widths {
+        s.push('+');
+        s.push_str(&"-".repeat(*w));
+    }
+    s.push('+');
+    s
 }
 
 /// 渲染某个窗口的额度：仅显示已用百分比（如 `12%`）；缺失则 `n/a`。
@@ -422,32 +438,26 @@ fn all_seven_day_exhausted(rows: &[Row]) -> bool {
         })
 }
 
-/// 渲染对齐表格（用 `|` 分隔列，按显示宽度对齐；中文 / emoji 账号名也对齐）：
+/// 渲染对齐表格（ASCII 表格：`+---+` 边框、列内左右各留一格、`|` 分隔；
+/// 按显示宽度对齐，中文 / emoji 账号名也不会把列撑歪）：
 /// 编号 / 当前 / 用户名 / 5h / 7d / recommend，底部给结论。
 fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
-    const W_ID: usize = 3;
-    const W_NOW: usize = 3;
-    const W_ACC: usize = 32;
-    const W_5H: usize = 7;
-    const W_7D: usize = 7;
-    const W_REC: usize = 10;
+    // 列宽已含两侧内边距（每列 ` content ` 占 width 列）。
+    const WIDTHS: [usize; 6] = [4, 5, 40, 8, 8, 12];
+    const HEADERS: [&str; 6] = ["#", "NOW", "ACCOUNT", "5H", "7D", "RECOMMEND"];
 
-    let bar = |w: usize| "-".repeat(w);
-    let sep = format!(
-        "|{}|{}|{}|{}|{}|{}|",
-        bar(W_ID), bar(W_NOW), bar(W_ACC), bar(W_5H), bar(W_7D), bar(W_REC)
-    );
+    let header_line: String = {
+        let mut s = String::from("|");
+        for (i, h) in HEADERS.iter().enumerate() {
+            s.push_str(&cell(h, WIDTHS[i], Align::Center));
+            s.push('|');
+        }
+        s
+    };
 
-    println!(
-        "|{}|{}|{}|{}|{}|{}|",
-        pad_cell("#", W_ID, Align::Left),
-        pad_cell("NOW", W_NOW, Align::Left),
-        pad_cell("ACCOUNT", W_ACC, Align::Left),
-        pad_cell("5H", W_5H, Align::Right),
-        pad_cell("7D", W_7D, Align::Right),
-        pad_cell("RECOMMEND", W_REC, Align::Left),
-    );
-    println!("{sep}");
+    println!("{}", sep_line(&WIDTHS));
+    println!("{header_line}");
+    println!("{}", sep_line(&WIDTHS));
 
     for (idx, row) in rows.iter().enumerate() {
         let n = idx + 1;
@@ -475,17 +485,23 @@ fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
             )
         };
         let rec = if Some(idx) == recommend_idx { "← use" } else { "" };
-        println!(
-            "|{}|{}|{}|{}|{}|{}|",
-            pad_cell(&n.to_string(), W_ID, Align::Right),
-            pad_cell(now, W_NOW, Align::Center),
-            pad_cell(&name_disp, W_ACC, Align::Left),
-            pad_cell(&h5, W_5H, h5_align),
-            pad_cell(&d7, W_7D, Align::Right),
-            pad_cell(rec, W_REC, Align::Left),
-        );
+        let cells = [
+            cell(&n.to_string(), WIDTHS[0], Align::Right),
+            cell(now, WIDTHS[1], Align::Center),
+            cell(&name_disp, WIDTHS[2], Align::Left),
+            cell(&h5, WIDTHS[3], h5_align),
+            cell(&d7, WIDTHS[4], Align::Right),
+            cell(rec, WIDTHS[5], Align::Left),
+        ];
+        let mut line = String::from("|");
+        for c in cells {
+            line.push_str(&c);
+            line.push('|');
+        }
+        println!("{line}");
     }
 
+    println!("{}", sep_line(&WIDTHS));
     println!();
     match recommend_idx {
         Some(i) => {
@@ -820,18 +836,24 @@ async fn auto(ctx: &AppContext, dry_run: bool) -> Result<()> {
         .and_then(|q| q.usage_ratio())
         .map(|r| r * 100.0)
         .unwrap_or(0.0);
+    let long_used = row
+        .quotas()
+        .and_then(|q| q.iter().find(|q| q.window == QuotaWindow::SevenDay))
+        .and_then(|q| q.usage_ratio())
+        .map(|r| r * 100.0)
+        .unwrap_or(0.0);
 
     if row.account.active {
         println!(
-            "already on best account kimi/{} (5h used {:.0}%)",
-            row.account.id, short_used
+            "already on best account kimi/{} (5h used {:.0}% · 7d used {:.0}%)",
+            row.account.id, short_used, long_used
         );
         return Ok(());
     }
     if dry_run {
         println!(
-            "would swap → kimi/{} (5h used {:.0}%)",
-            row.account.id, short_used
+            "would swap → kimi/{} (5h used {:.0}% · 7d used {:.0}%)",
+            row.account.id, short_used, long_used
         );
         return Ok(());
     }
@@ -841,8 +863,8 @@ async fn auto(ctx: &AppContext, dry_run: bool) -> Result<()> {
     ctx.audit
         .append(AuditEvent::ok("auto-activate", "kimi", Some(id.0.as_str())));
     println!(
-        "auto swap → kimi/{} (5h used {:.0}%)",
-        id, short_used
+        "auto swap → kimi/{} (5h used {:.0}% · 7d used {:.0}%)",
+        id, short_used, long_used
     );
     Ok(())
 }
