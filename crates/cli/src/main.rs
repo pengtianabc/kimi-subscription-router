@@ -318,27 +318,58 @@ async fn gather(ctx: &AppContext) -> Result<Vec<Row>> {
         .collect())
 }
 
-/// 截断到 `n` 个字符（按 Unicode 码点），避免中文邮箱撑破表格列宽。
-fn truncate(s: &str, n: usize) -> String {
-    let mut out = String::new();
-    for ch in s.chars() {
-        if out.chars().count() >= n {
-            break;
-        }
-        out.push(ch);
-    }
-    if out.chars().count() < s.chars().count() {
-        out.push('…');
-    }
-    out
+/// 字符显示宽度：ASCII 占 1 列，其余（CJK / emoji 等）占 2 列。
+/// 用显示宽度而非字符数来对齐，中文 / emoji 账号名才不会把表格撑歪。
+fn disp_width(s: &str) -> usize {
+    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
 }
 
-/// 渲染某个窗口的额度：`used/limit pct%`；缺失则 `n/a`。
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+/// 按显示宽度截断（超出加 `…`）并补齐到 `width` 列。`align` 控制左右 / 居中。
+fn pad_cell(s: &str, width: usize, align: Align) -> String {
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = if c.is_ascii() { 1 } else { 2 };
+        if w + cw > width {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    if w < disp_width(s) {
+        // 被截断，尽量补一个省略号。
+        if w + 2 <= width {
+            out.push('…');
+            w += 2;
+        } else if w + 1 <= width {
+            out.push('.');
+            w += 1;
+        }
+    }
+    let pad = width.saturating_sub(w);
+    match align {
+        Align::Left => format!("{}{}", out, " ".repeat(pad)),
+        Align::Center => {
+            let left = pad / 2;
+            format!("{}{}{}", " ".repeat(left), out, " ".repeat(pad - left))
+        }
+        Align::Right => format!("{}{}", " ".repeat(pad), out),
+    }
+}
+
+/// 渲染某个窗口的额度：仅显示已用百分比（如 `12%`）；缺失则 `n/a`。
 fn fmt_window(quotas: &[Quota], window: QuotaWindow) -> String {
     match quotas.iter().find(|q| q.window == window) {
         Some(q) => match q.usage_ratio() {
-            Some(r) => format!("{}/{} {:.0}%", q.used, q.limit, r * 100.0),
-            None => format!("{}/{}", q.used, q.limit),
+            Some(r) => format!("{:.0}%", r * 100.0),
+            None => "n/a".to_string(),
         },
         None => "n/a".to_string(),
     }
@@ -391,13 +422,33 @@ fn all_seven_day_exhausted(rows: &[Row]) -> bool {
         })
 }
 
-/// 渲染对齐表格：编号 / 当前 / 用户名 / 5h / 7d / recommend，底部给结论。
+/// 渲染对齐表格（用 `|` 分隔列，按显示宽度对齐；中文 / emoji 账号名也对齐）：
+/// 编号 / 当前 / 用户名 / 5h / 7d / recommend，底部给结论。
 fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
-    println!(
-        "{:<3} {:<4} {:<30} {:<14} {:<14} RECOMMEND",
-        "#", "NOW", "ACCOUNT", "5H", "7D"
+    const W_ID: usize = 3;
+    const W_NOW: usize = 3;
+    const W_ACC: usize = 32;
+    const W_5H: usize = 7;
+    const W_7D: usize = 7;
+    const W_REC: usize = 10;
+
+    let bar = |w: usize| "-".repeat(w);
+    let sep = format!(
+        "|{}|{}|{}|{}|{}|{}|",
+        bar(W_ID), bar(W_NOW), bar(W_ACC), bar(W_5H), bar(W_7D), bar(W_REC)
     );
-    println!("{}", "-".repeat(74));
+
+    println!(
+        "|{}|{}|{}|{}|{}|{}|",
+        pad_cell("#", W_ID, Align::Left),
+        pad_cell("NOW", W_NOW, Align::Left),
+        pad_cell("ACCOUNT", W_ACC, Align::Left),
+        pad_cell("5H", W_5H, Align::Right),
+        pad_cell("7D", W_7D, Align::Right),
+        pad_cell("RECOMMEND", W_REC, Align::Left),
+    );
+    println!("{sep}");
+
     for (idx, row) in rows.iter().enumerate() {
         let n = idx + 1;
         let now = if row.account.active { "*" } else { " " };
@@ -407,13 +458,12 @@ fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
         } else {
             format!("{name} ({})", row.account.id.0)
         };
-        let name_field = truncate(&name_disp, 28);
         let err = match &row.quota {
             Some(QuotaOutcome::Failed(e)) => Some(e.as_str()),
             _ => None,
         };
-        let (h5, d7) = if let Some(e) = err {
-            (truncate(e, 13), "—".to_string())
+        let (h5, d7, h5_align) = if let Some(e) = err {
+            (e.to_string(), "—".to_string(), Align::Left)
         } else {
             let q = row.quotas();
             (
@@ -421,12 +471,18 @@ fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
                     .unwrap_or_else(|| "n/a".into()),
                 q.map(|x| fmt_window(x, QuotaWindow::SevenDay))
                     .unwrap_or_else(|| "n/a".into()),
+                Align::Right,
             )
         };
         let rec = if Some(idx) == recommend_idx { "← use" } else { "" };
         println!(
-            "{:<3} {:<4} {:<30} {:<14} {:<14} {}",
-            n, now, name_field, h5, d7, rec
+            "|{}|{}|{}|{}|{}|{}|",
+            pad_cell(&n.to_string(), W_ID, Align::Right),
+            pad_cell(now, W_NOW, Align::Center),
+            pad_cell(&name_disp, W_ACC, Align::Left),
+            pad_cell(&h5, W_5H, h5_align),
+            pad_cell(&d7, W_7D, Align::Right),
+            pad_cell(rec, W_REC, Align::Left),
         );
     }
 

@@ -166,9 +166,6 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                 )
             })?;
         let id = AccountId(id_string);
-        let label = label_hint
-            .or_else(|| meta.label.clone())
-            .unwrap_or_else(|| id.0.clone());
 
         self.store.set(
             self.runtime.id(),
@@ -199,6 +196,13 @@ impl<A: FileBlobRuntime> FileBlobProvider<A> {
                 self.registry.remove(self.runtime.id(), &ex.id)?;
             }
         }
+
+        // 已有账号优先保留既有的 label（用户可能用 GUI/CLI 设过别名），
+        // 不要被 live 凭证里的 metadata 覆盖掉；只有全新导入才回落到 metadata / id。
+        let label = label_hint
+            .or_else(|| existing.as_ref().map(|a| a.label.clone()))
+            .or_else(|| meta.label.clone())
+            .unwrap_or_else(|| id.0.clone());
 
         let account = Account {
             provider: self.runtime.id().into(),
