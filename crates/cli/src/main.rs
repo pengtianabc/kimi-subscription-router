@@ -15,13 +15,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::NaiveDate;
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
-    settings, Account, AccountRegistry, AuditEvent, AuditLog, CredentialStore, FileStore,
-    KeyringStore, Provider, Quota, QuotaCache, QuotaWindow, RemovedAccounts,
+    settings, Account, AccountId, AccountRegistry, AuditEvent, AuditLog, CredentialStore,
+    FileStore, KeyringStore, Provider, Quota, QuotaCache, QuotaWindow, RemovedAccounts,
 };
 use kimi_switch_kimi::KimiProvider;
+
+/// registry `extra` 键：该账号是否参与自动路由（auto 切换候选）。与 GUI 保持一致。
+const EXTRA_ROUTING_ENABLED: &str = "routing_enabled";
+/// registry `extra` 键：订阅到期日（YYYY-MM-DD）。与 GUI 保持一致。
+const EXTRA_SUBSCRIPTION_EXPIRES_ON: &str = "subscription_expires_on";
 
 #[derive(Parser)]
 #[command(
@@ -58,6 +64,38 @@ enum Cmd {
     Rm {
         /// Account index (e.g. `1`), id, label, or `kimi/<id>`.
         id: String,
+    },
+
+    /// List accounts with quota and current-active marker (also the default action).
+    List {
+        /// Emit machine-readable JSON instead of the formatted table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Update account metadata for <id|N>.
+    Set {
+        /// Account index (e.g. `1`), id, label, or `kimi/<id>`.
+        id: String,
+        /// Friendly alias shown in listings.
+        #[arg(long)]
+        label: Option<String>,
+        /// Manual priority; lower number wins ties in auto-switch.
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Toggle participation in auto-switch / auto-routing.
+        #[arg(long = "routing-enabled")]
+        routing_enabled: Option<bool>,
+        /// Subscription expiry as YYYY-MM-DD (empty string clears it).
+        #[arg(long = "subscription-expires-on")]
+        subscription_expires_on: Option<String>,
+    },
+
+    /// Auto-switch to the account with the most remaining short-window (5h) quota.
+    Auto {
+        /// Print the chosen account without actually switching.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -136,6 +174,15 @@ async fn main() -> Result<()> {
         Some(Cmd::Login { provider }) => login(&ctx, &provider),
         Some(Cmd::Swap { id }) => swap(&ctx, id.as_deref()).await,
         Some(Cmd::Rm { id }) => rm(&ctx, &id).await,
+        Some(Cmd::List { json }) => list(&ctx, json).await,
+        Some(Cmd::Set {
+            id,
+            label,
+            priority,
+            routing_enabled,
+            subscription_expires_on,
+        }) => set(&ctx, &id, label, priority, routing_enabled, subscription_expires_on).await,
+        Some(Cmd::Auto { dry_run }) => auto(&ctx, dry_run).await,
     }
 }
 
@@ -151,15 +198,16 @@ enum QuotaOutcome {
     Failed(String),
 }
 
-async fn status(ctx: &AppContext) -> Result<()> {
+/// 拉齐本地激活账号 + 列出账号 + 并发查额度（带缓存节流）。返回 (账号, 额度结果) 列表，
+/// 供默认 `status` 与 `list` 共用，避免重复网络/缓存逻辑。
+async fn gather(ctx: &AppContext) -> Result<Vec<(Account, Option<QuotaOutcome>)>> {
     // 1. 自动导入/对齐本地激活账号（`rm` 过的账号有墓碑，跳过）。
     sync_local_active(ctx);
 
     // 2. 列出账号。
     let accounts = ctx.list_ordered()?;
     if accounts.is_empty() {
-        println!("No accounts. Sign in to Kimi Code, then run `kimi-switch login kimi`.");
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     // 3. 并发查额度（缓存节流 + 失败退避，避免高频打 usage 端点）。
@@ -222,9 +270,13 @@ async fn status(ctx: &AppContext) -> Result<()> {
     }
     cache.save(&cache_path);
 
-    // 4. 渲染。
+    Ok(accounts.into_iter().zip(outcomes).collect())
+}
+
+/// 把 (账号, 额度结果) 渲染成人类可读表格（与默认入口一致）。
+fn render_rows(rows: &[(Account, Option<QuotaOutcome>)]) {
     println!("kimi");
-    for (idx, (account, outcome)) in accounts.iter().zip(outcomes.iter()).enumerate() {
+    for (idx, (account, outcome)) in rows.iter().enumerate() {
         let n = idx + 1;
         let star = if account.active { "*" } else { " " };
         let quota_text = match outcome {
@@ -235,6 +287,65 @@ async fn status(ctx: &AppContext) -> Result<()> {
         };
         println!("  {star} {n:>2}  {:<24} {quota_text}", account.id);
     }
+}
+
+async fn status(ctx: &AppContext) -> Result<()> {
+    let rows = gather(ctx).await?;
+    if rows.is_empty() {
+        println!("No accounts. Sign in to Kimi Code, then run `kimi-switch login kimi`.");
+        return Ok(());
+    }
+    render_rows(&rows);
+    Ok(())
+}
+
+/// `list` 子命令：复用 `gather` 的账号 + 额度数据。`--json` 输出机器可读 JSON（供 GUI/工具读取）。
+async fn list(ctx: &AppContext, json: bool) -> Result<()> {
+    let rows = gather(ctx).await?;
+    if rows.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            println!("No accounts. Sign in to Kimi Code, then run `kimi-switch login kimi`.");
+        }
+        return Ok(());
+    }
+    if !json {
+        render_rows(&rows);
+        return Ok(());
+    }
+    let items: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|(account, outcome)| {
+            let quotas: Vec<serde_json::Value> = match outcome {
+                Some(QuotaOutcome::Ready(q)) | Some(QuotaOutcome::Stale(q)) => q
+                    .iter()
+                    .map(|q| {
+                        serde_json::json!({
+                            "window": format!("{:?}", q.window),
+                            "used": q.used,
+                            "limit": q.limit,
+                            "usedRatio": q.usage_ratio(),
+                            "status": format!("{:?}", q.status),
+                            "resetAt": q.reset_at.map(|t| t.to_rfc3339()),
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            serde_json::json!({
+                "id": account.id.0,
+                "label": account.label,
+                "active": account.active,
+                "priority": account.priority,
+                "manualOnly": account.manual_only(),
+                "routingEnabled": account.extra.get(EXTRA_ROUTING_ENABLED).and_then(|v| v.as_bool()),
+                "subscriptionExpiresOn": account.extra.get(EXTRA_SUBSCRIPTION_EXPIRES_ON).and_then(|v| v.as_str()),
+                "quotas": quotas,
+            })
+        })
+        .collect();
+    println!("{}", serde_json::to_string_pretty(&items)?);
     Ok(())
 }
 
@@ -396,5 +507,191 @@ async fn rm(ctx: &AppContext, id_input: &str) -> Result<()> {
     ctx.audit
         .append(AuditEvent::ok("rm", "kimi", Some(acc.id.0.as_str())));
     println!("removed kimi/{}", acc.id);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// set（改：更新账号元数据）
+// ---------------------------------------------------------------------------
+
+/// 把用户写的订阅到期日归一化为 `YYYY-MM-DD`；空串表示清除该字段。与 GUI 校验保持一致。
+fn normalize_subscription_expiry(value: &str) -> Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("invalid date; use YYYY-MM-DD, e.g. 2026-09-30"))?;
+    Ok(Some(date.format("%Y-%m-%d").to_string()))
+}
+
+/// 更新账号元数据（CLI 的「改」）。至少传一个字段；字段映射与 GUI `update_account` 一致：
+/// label → `account.label`；priority → `account.priority`；routing-enabled → `extra.routing_enabled`；
+/// subscription-expires-on → `extra.subscription_expires_on`。
+async fn set(
+    ctx: &AppContext,
+    id_input: &str,
+    label: Option<String>,
+    priority: Option<i32>,
+    routing_enabled: Option<bool>,
+    subscription_expires_on: Option<String>,
+) -> Result<()> {
+    if label.is_none()
+        && priority.is_none()
+        && routing_enabled.is_none()
+        && subscription_expires_on.is_none()
+    {
+        anyhow::bail!(
+            "nothing to update; pass at least one of --label / --priority / \
+             --routing-enabled / --subscription-expires-on"
+        );
+    }
+
+    let acc = resolve_account(ctx, id_input)?;
+    let mut account = ctx
+        .registry
+        .find("kimi", &acc.id)?
+        .ok_or_else(|| anyhow::anyhow!("account kimi/{} not found", acc.id))?;
+
+    if let Some(label) = label {
+        let label = label.trim();
+        if label.is_empty() {
+            anyhow::bail!("account label cannot be empty");
+        }
+        account.label = label.to_string();
+    }
+    if let Some(priority) = priority {
+        if !(-10_000..=10_000).contains(&priority) {
+            anyhow::bail!("priority must be between -10000 and 10000");
+        }
+        account.priority = priority;
+    }
+    if let Some(enabled) = routing_enabled {
+        account
+            .extra
+            .insert(EXTRA_ROUTING_ENABLED.into(), enabled.into());
+    }
+    if let Some(expires_on) = subscription_expires_on {
+        match normalize_subscription_expiry(&expires_on)? {
+            Some(value) => account
+                .extra
+                .insert(EXTRA_SUBSCRIPTION_EXPIRES_ON.into(), serde_json::Value::String(value)),
+            None => account.extra.remove(EXTRA_SUBSCRIPTION_EXPIRES_ON),
+        };
+    }
+
+    ctx.registry.upsert(account.clone())?;
+    ctx.audit
+        .append(AuditEvent::ok("update", "kimi", Some(acc.id.0.as_str())));
+    println!("updated kimi/{}", acc.id);
+    println!(
+        "  label={} priority={} routing_enabled={} subscription_expires_on={:?}",
+        account.label,
+        account.priority,
+        account
+            .extra
+            .get(EXTRA_ROUTING_ENABLED)
+            .and_then(|v| v.as_bool())
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "unset".into()),
+        account
+            .extra
+            .get(EXTRA_SUBSCRIPTION_EXPIRES_ON)
+            .and_then(|v| v.as_str())
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// auto（自动切换：谁还有短窗口额度就切谁）
+// ---------------------------------------------------------------------------
+
+/// 自动切换：在「短窗口（5h）还有剩余额度」的账号里，选剩余最多者激活。
+///
+/// 选择规则：
+/// - 排除 `manual_only` 账号（只手动激活）。
+/// - 只认有短窗口额度、且用量 < 100% 的账号（耗尽/未知一律不选，避免切到死号）。
+/// - 并列时按 priority 升序、再按 id 升序。当前已是该账号则不打扰。
+async fn auto(ctx: &AppContext, dry_run: bool) -> Result<()> {
+    let rows = gather(ctx).await?;
+    if rows.is_empty() {
+        anyhow::bail!("no accounts; run `kimi-switch login kimi` first");
+    }
+
+    struct Candidate {
+        id: String,
+        used_ratio: f64,
+        active: bool,
+        priority: i32,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for (account, outcome) in &rows {
+        if account.manual_only() {
+            continue;
+        }
+        let quotas = match outcome {
+            Some(QuotaOutcome::Ready(q)) | Some(QuotaOutcome::Stale(q)) => q,
+            _ => continue, // 未知/失败：保守不选
+        };
+        let Some(short) = quotas
+            .iter()
+            .find(|q| q.window == QuotaWindow::FiveHour)
+        else {
+            continue; // 该账号没有短窗口额度
+        };
+        let Some(ratio) = short.usage_ratio() else {
+            continue;
+        };
+        if ratio >= 1.0 {
+            continue; // 已耗尽
+        }
+        candidates.push(Candidate {
+            id: account.id.0.clone(),
+            used_ratio: ratio,
+            active: account.active,
+            priority: account.priority,
+        });
+    }
+
+    if candidates.is_empty() {
+        anyhow::bail!(
+            "no account has remaining short-window (5h) quota; all exhausted or unknown"
+        );
+    }
+    candidates.sort_by(|a, b| {
+        a.used_ratio
+            .partial_cmp(&b.used_ratio)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.priority.cmp(&b.priority))
+            .then(a.id.cmp(&b.id))
+    });
+    let best = &candidates[0];
+
+    if best.active {
+        println!(
+            "already on best account kimi/{} (5h used {:.0}%)",
+            best.id,
+            best.used_ratio * 100.0
+        );
+        return Ok(());
+    }
+    if dry_run {
+        println!(
+            "would swap → kimi/{} (5h used {:.0}%)",
+            best.id,
+            best.used_ratio * 100.0
+        );
+        return Ok(());
+    }
+
+    let id = AccountId(best.id.clone());
+    ctx.kimi.activate(&id).await?;
+    ctx.audit
+        .append(AuditEvent::ok("auto-activate", "kimi", Some(best.id.as_str())));
+    println!(
+        "auto swap → kimi/{} (5h used {:.0}%)",
+        best.id,
+        best.used_ratio * 100.0
+    );
     Ok(())
 }
