@@ -376,15 +376,19 @@ fn sep_line(widths: &[usize]) -> String {
     s
 }
 
-/// 把剩余时间渲染为紧凑相对形式：`5m` / `4h` / `2d`。
+/// 把剩余时间渲染为两单位紧凑相对形式：`45m` / `3h15m` / `1d4h` / `30s`。
+/// 同时带上相邻的小单位，避免只显示 `3h`、`1d` 而丢失分钟 / 小时。
 fn fmt_relative(d: chrono::Duration) -> String {
     let secs = d.num_seconds().max(0);
-    if secs >= 86_400 {
-        format!("{}d", secs / 86_400)
-    } else if secs >= 3_600 {
-        format!("{}h", secs / 3_600)
-    } else if secs >= 60 {
-        format!("{}m", secs / 60)
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        format!("{}d{}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h{}m", hours, mins)
+    } else if mins > 0 {
+        format!("{}m", mins)
     } else {
         format!("{}s", secs)
     }
@@ -475,7 +479,7 @@ fn all_seven_day_exhausted(rows: &[Row]) -> bool {
 /// 编号 / 当前 / 用户名 / 5h / 7d / recommend，底部给结论。
 fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
     // 列宽已含两侧内边距（每列 ` content ` 占 width 列）。
-    const WIDTHS: [usize; 6] = [4, 5, 36, 12, 12, 12];
+    const WIDTHS: [usize; 6] = [4, 5, 36, 14, 14, 12];
     const HEADERS: [&str; 6] = ["#", "ON", "ACCOUNT", "5H", "7D", "RECOMMEND"];
 
     let now_utc = Utc::now();
@@ -510,13 +514,14 @@ fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
         } else {
             let q = row.quotas();
             // 把 `pct%` 与重置剩余时间拼成 `pct% · Xh`，各部分固定列宽，使 `·` 对齐。
+            // reset 固定 5 列宽（最大为 `3h15m`），pct 已固定 4 列宽。
             let join = |w: QuotaWindow| -> String {
                 match q {
                     Some(qq) => {
                         let (pct, reset) = fmt_window(qq, w, now_utc);
-                        format!("{} · {:2}", pct, reset)
+                        format!("{} · {:>5}", pct, reset)
                     }
-                    None => "n/a ·  —".to_string(),
+                    None => "n/a ·   —".to_string(),
                 }
             };
             (
