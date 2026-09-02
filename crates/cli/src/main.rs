@@ -983,26 +983,27 @@ fn extract_script_path(cmd: &str) -> Option<PathBuf> {
     None
 }
 
-/// 执行前校验 shell 命令 / 脚本的可用性：
+/// 执行前检查命令引用的脚本文件是否存在；返回第一个缺失的脚本路径。
+/// 用于运行时提示——脚本还没创建时 watch 应继续等待，而不是拒绝启动。
+fn missing_script(cmd: &str) -> Option<PathBuf> {
+    match extract_script_path(cmd) {
+        Some(p) if !p.exists() => Some(p),
+        _ => None,
+    }
+}
+
+/// 执行前校验 shell 命令的语法可用性（不检查脚本文件是否存在）：
 /// - 非空；
-/// - 若引用了脚本文件，检查它存在；
 /// - 用 `bash -n -c` / `sh -n -c` 做语法检查（不实际执行）。
+///
+/// 脚本文件是否存在放到「每次执行前」再检查（见 `missing_script`），这样即便脚本还没
+/// 创建，watch 也能先启动，等文件就绪后再自动执行。
 fn validate_shell_command(cmd: &str) -> Result<()> {
     let cmd = cmd.trim();
     if cmd.is_empty() {
         anyhow::bail!(
             "command is empty; pass a shell command, e.g. `kimi-switch watch 'bash run.sh'`"
         );
-    }
-
-    if let Some(script) = extract_script_path(cmd) {
-        if !script.exists() {
-            anyhow::bail!(
-                "script not found: {} (referenced by `{}`)",
-                script.display(),
-                cmd
-            );
-        }
     }
 
     let output = match ProcCommand::new("bash").args(["-n", "-c", cmd]).output() {
@@ -1105,6 +1106,17 @@ async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: 
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
             Some(idx) => {
+                // 执行前再确认脚本已就绪（允许 watch 在脚本尚未创建时就启动）。
+                // 脚本缺失时不切账号、不计入次数，只等待其出现后下一轮再执行。
+                if let Some(missing) = missing_script(&command) {
+                    println!(
+                        "  ⏳ script not ready: {} (waiting for it to appear before running)",
+                        missing.display()
+                    );
+                    tokio::time::sleep(Duration::from_secs(interval)).await;
+                    continue;
+                }
+
                 let target = &rows[idx];
                 let active_idx = rows.iter().position(|r| r.account.active);
                 if active_idx != Some(idx) {
