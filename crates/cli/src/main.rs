@@ -16,6 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, NaiveDate, Utc};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
@@ -318,11 +319,9 @@ async fn gather(ctx: &AppContext) -> Result<Vec<Row>> {
         .collect())
 }
 
-/// 字符显示宽度：ASCII 占 1 列，其余（CJK / emoji 等）占 2 列。
-/// 用显示宽度而非字符数来对齐，中文 / emoji 账号名才不会把表格撑歪。
-fn disp_width(s: &str) -> usize {
-    s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum()
-}
+/// 字符显示宽度用 `unicode-width` 计算（`UnicodeWidthStr::width` / `UnicodeWidthChar::width`）：
+/// CJK / 全角 / emoji 占 2 列，拉丁扩展、Tai Le 等普通 Unicode 字母仍占 1 列，
+/// 这样含 emoji 的账号名才能在表格里正确对齐。
 
 #[derive(Clone, Copy)]
 enum Align {
@@ -336,20 +335,17 @@ fn pad_cell(s: &str, width: usize, align: Align) -> String {
     let mut out = String::new();
     let mut w = 0usize;
     for c in s.chars() {
-        let cw = if c.is_ascii() { 1 } else { 2 };
+        let cw = UnicodeWidthChar::width(c).unwrap_or(1);
         if w + cw > width {
             break;
         }
         out.push(c);
         w += cw;
     }
-    if w < disp_width(s) {
-        // 被截断，尽量补一个省略号。
-        if w + 2 <= width {
+    if w < UnicodeWidthStr::width(s) {
+        // 被截断，尽量补一个省略号（U+2026 占 1 列）。
+        if w < width {
             out.push('…');
-            w += 2;
-        } else if w < width {
-            out.push('.');
             w += 1;
         }
     }

@@ -58,6 +58,9 @@ rfd = "0.15.4"
 # 时间
 chrono = { version = "0.4", features = ["serde"] }
 
+# 终端列宽（正确处理 CJK / emoji / 宽字符）
+unicode-width = "0.2"
+
 # workspace 内部 crate 互相引用
 kimi-switch-core = { path = "crates/core" }
 kimi-switch-engine = { path = "crates/providers/common" }
