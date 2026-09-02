@@ -7,10 +7,16 @@
 //! - `kimi-switch swap <id|N>`  — 切换激活账号。原子写 + 快照回滚，不依赖网络/quota。
 //!   无参数时只打印编号列表，不做切换。
 //! - `kimi-switch rm <id|N>`    — 删除账号（registry + 凭证仓库 + 墓碑）。
+//! - `kimi-switch auto`         — 切到 5h 额度剩余最多的账号（dry-run 只打印）。
+//! - `kimi-switch watch 'bash run.sh'` — 循环监控额度：当前账号 5h 用光后，等有额度的
+//!   账号就自动切换并重新执行命令（`--cnt` 限制生效次数，屏幕每次轮询清屏）。
 //!
 //! `<id>` 是账号 id（Kimi user_id）、label 或 `kimi/<id>`；`<N>` 是默认入口
 //! 显示的编号（1 起）。
 
+use std::io::{self, BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcCommand, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -98,6 +104,25 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Watch quota and keep running <command> on whichever account has 5h quota.
+    ///
+    /// The program blocks and polls quota on an interval. When the active account's
+    /// 5h quota runs out, it waits until some account has quota available, auto-switches
+    /// to it, then re-runs <command>. The screen is cleared between polls instead of
+    /// spam-printing. <command> is checked for usability (script exists + shell syntax)
+    /// before the first run.
+    Watch {
+        /// Shell command / script to run when an account has quota.
+        /// Example: `kimi-switch watch 'bash run.sh'`.
+        command: String,
+        /// 生效次数：执行多少次后退出（默认无限）。
+        #[arg(short = 'c', long = "cnt")]
+        cnt: Option<usize>,
+        /// 轮询间隔（秒）。
+        #[arg(long, default_value_t = 30)]
+        interval: u64,
+    },
 }
 
 /// 进程级共享上下文：明文文件凭证仓库 + registry + Kimi provider。
@@ -184,6 +209,11 @@ async fn main() -> Result<()> {
             subscription_expires_on,
         }) => set(&ctx, &id, label, priority, routing_enabled, subscription_expires_on).await,
         Some(Cmd::Auto { dry_run }) => auto(&ctx, dry_run).await,
+        Some(Cmd::Watch {
+            command,
+            cnt,
+            interval,
+        }) => watch(&ctx, command, cnt, interval).await,
     }
 }
 
@@ -912,5 +942,205 @@ async fn auto(ctx: &AppContext, dry_run: bool) -> Result<()> {
         "auto swap → kimi/{} (5h used {:.0}% · 7d used {:.0}%)",
         id, short_used, long_used
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// watch（循环监控额度，自动切换后执行 shell 命令）
+// ---------------------------------------------------------------------------
+
+/// 清屏并把光标移到左上角（ANSI escape）。这样每次轮询都重绘监控视图，而不是一直往下刷。
+fn clear_screen() {
+    print!("\x1b[2J\x1b[H");
+    let _ = io::stdout().flush();
+}
+
+/// 从命令串里尽量抽出被引用的脚本路径，用于可用性检查：
+/// - `bash run.sh` / `sh -e run.sh` / `python3 run.py` 等；
+/// - 直接 `./run.sh` 或绝对路径 `/x/y.sh`。
+///
+/// 仅做启发式判断，抽不到返回 None（跳过文件检查）。
+fn extract_script_path(cmd: &str) -> Option<PathBuf> {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let first = *tokens.first()?;
+    if matches!(
+        first,
+        "bash" | "sh" | "zsh" | "python" | "python3" | "node" | "perl"
+    ) {
+        for t in &tokens[1..] {
+            if t.starts_with('-') {
+                continue; // 选项，跳过
+            }
+            if t.contains('/') && !t.starts_with('>') && !t.starts_with('|') {
+                return Some(PathBuf::from(t));
+            }
+        }
+        return None;
+    }
+    if (first.starts_with("./") || first.starts_with('/')) && first.contains('.') {
+        return Some(PathBuf::from(first));
+    }
+    None
+}
+
+/// 执行前校验 shell 命令 / 脚本的可用性：
+/// - 非空；
+/// - 若引用了脚本文件，检查它存在；
+/// - 用 `bash -n -c` / `sh -n -c` 做语法检查（不实际执行）。
+fn validate_shell_command(cmd: &str) -> Result<()> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        anyhow::bail!(
+            "command is empty; pass a shell command, e.g. `kimi-switch watch 'bash run.sh'`"
+        );
+    }
+
+    if let Some(script) = extract_script_path(cmd) {
+        if !script.exists() {
+            anyhow::bail!(
+                "script not found: {} (referenced by `{}`)",
+                script.display(),
+                cmd
+            );
+        }
+    }
+
+    let output = match ProcCommand::new("bash").args(["-n", "-c", cmd]).output() {
+        Ok(o) => o,
+        Err(_) => ProcCommand::new("sh")
+            .args(["-n", "-c", cmd])
+            .output()
+            .context("no `bash` or `sh` available to validate the command")?,
+    };
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "shell syntax check failed for `{}`:\n{}",
+            cmd,
+            stderr.trim()
+        );
+    }
+    Ok(())
+}
+
+/// 执行 shell 命令：实时输出同时打到终端与 watch 日志文件，返回退出码。
+/// 用 `(command) 2>&1` 把 stderr 并到 stdout，便于统一捕获。
+fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
+    let mut child = ProcCommand::new("sh")
+        .arg("-c")
+        .arg(format!("({}) 2>&1", command))
+        .stdout(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn shell for: {command}"))?;
+
+    let stamp = Utc::now().to_rfc3339();
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .context("open watch log file")?;
+    let _ = writeln!(log, "=== run @ {stamp} :: {command} ===");
+
+    let stdout = child.stdout.take().context("no stdout from child")?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        print!("{line}");
+        let _ = io::stdout().flush();
+        let _ = log.write_all(line.as_bytes());
+        let _ = log.flush();
+    }
+    let status = child.wait()?;
+    let code = status.code().unwrap_or(-1);
+    let _ = writeln!(log, "=== exit code {code} ===\n");
+    Ok(code)
+}
+
+/// watch 主循环：清屏 → 渲染监控表 → 若有账号有 5h 额度就切到它并执行命令；
+/// 额度用光则等待（轮询）到有额度再切换后执行。`--cnt` 限制有效执行次数。
+async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: u64) -> Result<()> {
+    validate_shell_command(&command)?;
+
+    let log_path = AppPaths::resolve()?.config_dir.join("watch.log");
+    let total = cnt.unwrap_or(usize::MAX);
+    let mut done = 0usize;
+
+    loop {
+        clear_screen();
+        let rows = gather(ctx).await?;
+        if rows.is_empty() {
+            println!("No accounts. Sign in to Kimi Code, then run `kimi-switch login kimi`.");
+            return Ok(());
+        }
+        let rec_idx = compute_recommend(&rows);
+        render_table(&rows, rec_idx);
+
+        println!("▶ watch: {command}");
+        println!(
+            "  target runs: {}{} | poll every {}s | log: {} (Ctrl-C to stop)",
+            done,
+            if total != usize::MAX {
+                format!("/{total}")
+            } else {
+                String::new()
+            },
+            interval,
+            log_path.display()
+        );
+
+        if done >= total {
+            println!();
+            println!("watch done: completed {done} run(s).");
+            break;
+        }
+
+        match rec_idx {
+            None => {
+                println!("  ⏳ no 5h quota available anywhere; waiting for reset…");
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+            Some(idx) => {
+                let target = &rows[idx];
+                let active_idx = rows.iter().position(|r| r.account.active);
+                if active_idx != Some(idx) {
+                    let id = target.account.id.clone();
+                    match ctx.kimi.activate(&id).await {
+                        Ok(()) => {
+                            println!(
+                                "  🔁 switched → kimi/{} {}",
+                                id,
+                                target.display_name()
+                            );
+                            ctx.audit.append(AuditEvent::ok(
+                                "watch-activate",
+                                "kimi",
+                                Some(id.0.as_str()),
+                            ));
+                        }
+                        Err(e) => {
+                            eprintln!("  switch failed: {e}");
+                            tokio::time::sleep(Duration::from_secs(interval)).await;
+                            continue;
+                        }
+                    }
+                }
+
+                println!("  ▶ run #{}{}: {}", done + 1, if total != usize::MAX { format!(" (of {total})") } else { String::new() }, command);
+                println!("  ────────────────────────────────");
+                let code = run_command_logged(&command, &log_path)?;
+                println!("  ────────────────────────────────");
+                println!("  run #{} exited with code {}", done + 1, code);
+                done += 1;
+
+                // 命令可能已把这台账号的 5h 额度打光，下一轮重新评估 / 切换。
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            }
+        }
+    }
     Ok(())
 }

@@ -200,6 +200,9 @@ macOS（开发构建的二进制名为 `kimi-switch-cli`，发布包中名为 `K
 "./kimi-switch-cli" rm <编号或 ID>                    # 删除账号
 "./kimi-switch-cli" auto                             # 按额度自动切换到最优账号
 "./kimi-switch-cli" auto --dry-run                   # 只打印会切到的账号，不真正切换
+"./kimi-switch-cli" watch 'bash run.sh'              # 循环监控额度：当前账号 5h 用光后自动切换到有额度的账号并执行命令
+"./kimi-switch-cli" watch --cnt 3 'bash run.sh'       # 只生效 3 次（执行 3 次后退出）
+"./kimi-switch-cli" watch --interval 60 'bash run.sh' # 每 60 秒轮询一次
 ```
 
 Windows PowerShell（发布包中使用 `Kimi Subscription Router CLI.exe`，子命令相同）：
@@ -207,6 +210,7 @@ Windows PowerShell（发布包中使用 `Kimi Subscription Router CLI.exe`，子
 ```powershell
 & ".\Kimi Subscription Router CLI.exe" list
 & ".\Kimi Subscription Router CLI.exe" auto --dry-run
+& ".\Kimi Subscription Router CLI.exe" watch 'bash run.sh'
 ```
 
 子命令说明：
@@ -214,6 +218,7 @@ Windows PowerShell（发布包中使用 `Kimi Subscription Router CLI.exe`，子
 - `list` / 无参数：以表格展示每个账号的当前激活标记、用户名（优先显示邮箱或别名）、5 小时与 7 天额度已用百分比，并自动计算 `RECOMMEND` 列指出当前最值得使用的账号。带 `--json` 会输出含邮箱、`displayLabel` 与 `recommend` 字段的 JSON，便于脚本解析。
 - `set`：更新账号元数据。`--label` 设置别名；`--priority` 取值范围 -10000~10000，数值越小在自动切换中越优先；`--routing-enabled` 设置是否参与自动路由；`--subscription-expires-on` 记录订阅到期日（YYYY-MM-DD，传空串清除）。
 - `auto`：依据额度自动切换当前账号。筛选与排序规则为：5 小时窗口必须仍有剩余；7 天已耗尽（已用约 100%）的账号排到最后，即便 5h 还有剩余；其余按 5h 剩余降序、7d 剩余降序、priority 升序、id 升序选择。加 `--dry-run` 只预览不切换。
+- `watch`：常驻监控额度并循环执行指定命令，适合「脚本跑 kimi 任务、额度用光就停、等有额度再自动切换接着跑」的场景。执行前会校验命令/脚本可用性（脚本文件存在 + `bash -n` 语法检查）；运行时清屏重绘监控表（不刷屏），每隔 `--interval` 秒（默认 30）轮询一次；若当前激活账号 5h 额度耗尽，会等待到有额度的账号并自动切换，再执行命令并实时打印其输出（同时落盘到配置目录的 `watch.log`）。`--cnt|-c` 限制生效次数（默认无限），达到次数后退出。
 
 GUI 和 CLI 使用同一份本机账号库，可以混合使用。
 
