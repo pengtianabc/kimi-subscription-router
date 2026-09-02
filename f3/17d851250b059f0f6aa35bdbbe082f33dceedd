@@ -1,0 +1,20 @@
+Cargo.lock
+  h_53aea25a6c6376 822,2180,4515-4520
+Cargo.toml
+  h_53aea25a6c6376 61-63
+crates/cli/Cargo.toml
+  h_53aea25a6c6376 29
+crates/cli/src/main.rs
+  h_53aea25a6c6376 19,322-324,338,345-347
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "f317d851250b059f0f6aa35bdbbe082f33dceedd",
+  "prompts": {},
+  "humans": {
+    "h_53aea25a6c6376": {
+      "author": "彭添 <pengtian@intra.nsfocus.com>"
+    }
+  }
+}
