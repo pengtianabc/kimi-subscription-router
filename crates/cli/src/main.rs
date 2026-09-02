@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
@@ -1070,6 +1070,8 @@ async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: 
     let log_path = AppPaths::resolve()?.config_dir.join("watch.log");
     let total = cnt.unwrap_or(usize::MAX);
     let mut done = 0usize;
+    let mut last_run_at: Option<DateTime<Utc>> = None;
+    let mut last_exit: Option<i32> = None;
 
     loop {
         clear_screen();
@@ -1082,14 +1084,23 @@ async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: 
         render_table(&rows, rec_idx);
 
         println!("▶ watch: {command}");
+        let last = match (last_run_at, last_exit) {
+            (Some(t), Some(c)) => format!(
+                "last: {} · exit {}",
+                t.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S"),
+                c
+            ),
+            _ => "last: —".to_string(),
+        };
         println!(
-            "  target runs: {}{} | poll every {}s | log: {} (Ctrl-C to stop)",
+            "  runs: {}{} | {} | poll every {}s | log: {} (Ctrl-C to stop)",
             done,
             if total != usize::MAX {
                 format!("/{total}")
             } else {
                 String::new()
             },
+            last,
             interval,
             log_path.display()
         );
@@ -1147,6 +1158,8 @@ async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: 
                 let code = run_command_logged(&command, &log_path)?;
                 println!("  ────────────────────────────────");
                 println!("  run #{} exited with code {}", done + 1, code);
+                last_run_at = Some(Utc::now());
+                last_exit = Some(code);
                 done += 1;
 
                 // 命令可能已把这台账号的 5h 额度打光，下一轮重新评估 / 切换。
