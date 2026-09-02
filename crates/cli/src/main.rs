@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::NaiveDate;
+use chrono::{DateTime, NaiveDate, Utc};
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
@@ -380,14 +380,36 @@ fn sep_line(widths: &[usize]) -> String {
     s
 }
 
-/// 渲染某个窗口的额度：仅显示已用百分比（如 `12%`）；缺失则 `n/a`。
-fn fmt_window(quotas: &[Quota], window: QuotaWindow) -> String {
+/// 把剩余时间渲染为紧凑相对形式：`5m` / `4h` / `2d`。
+fn fmt_relative(d: chrono::Duration) -> String {
+    let secs = d.num_seconds().max(0);
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
+}
+
+/// 渲染某个窗口的额度：返回 `(已用百分比, 距离重置的剩余时间)`。
+/// 缺失时百分比为 `n/a`、剩余时间为 `—`。
+fn fmt_window(quotas: &[Quota], window: QuotaWindow, now: DateTime<Utc>) -> (String, String) {
     match quotas.iter().find(|q| q.window == window) {
-        Some(q) => match q.usage_ratio() {
-            Some(r) => format!("{:.0}%", r * 100.0),
-            None => "n/a".to_string(),
-        },
-        None => "n/a".to_string(),
+        Some(q) => {
+            let pct = match q.usage_ratio() {
+                Some(r) => format!("{:.0}%", r * 100.0),
+                None => "n/a".to_string(),
+            };
+            let reset = match q.reset_at {
+                Some(t) => fmt_relative(t - now),
+                None => "—".to_string(),
+            };
+            (format!("{:>4}", pct), format!("{:2}", reset))
+        }
+        None => ("n/a".to_string(), "—".to_string()),
     }
 }
 
@@ -457,9 +479,10 @@ fn all_seven_day_exhausted(rows: &[Row]) -> bool {
 /// 编号 / 当前 / 用户名 / 5h / 7d / recommend，底部给结论。
 fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
     // 列宽已含两侧内边距（每列 ` content ` 占 width 列）。
-    const WIDTHS: [usize; 6] = [4, 5, 40, 8, 8, 12];
+    const WIDTHS: [usize; 6] = [4, 5, 36, 12, 12, 12];
     const HEADERS: [&str; 6] = ["#", "ON", "ACCOUNT", "5H", "7D", "RECOMMEND"];
 
+    let now_utc = Utc::now();
     let header_line: String = {
         let mut s = String::from("|");
         for (i, h) in HEADERS.iter().enumerate() {
@@ -490,12 +513,20 @@ fn render_table(rows: &[Row], recommend_idx: Option<usize>) {
             (e.to_string(), "—".to_string(), Align::Left)
         } else {
             let q = row.quotas();
+            // 把 `pct%` 与重置剩余时间拼成 `pct% · Xh`，各部分固定列宽，使 `·` 对齐。
+            let join = |w: QuotaWindow| -> String {
+                match q {
+                    Some(qq) => {
+                        let (pct, reset) = fmt_window(qq, w, now_utc);
+                        format!("{} · {:2}", pct, reset)
+                    }
+                    None => "n/a ·  —".to_string(),
+                }
+            };
             (
-                q.map(|x| fmt_window(x, QuotaWindow::FiveHour))
-                    .unwrap_or_else(|| "n/a".into()),
-                q.map(|x| fmt_window(x, QuotaWindow::SevenDay))
-                    .unwrap_or_else(|| "n/a".into()),
-                Align::Right,
+                join(QuotaWindow::FiveHour),
+                join(QuotaWindow::SevenDay),
+                Align::Left,
             )
         };
         let rec = if Some(idx) == recommend_idx { "← use" } else { "" };
