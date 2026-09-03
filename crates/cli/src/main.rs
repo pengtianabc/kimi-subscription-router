@@ -476,16 +476,23 @@ fn fmt_window(quotas: &[Quota], window: QuotaWindow, now: DateTime<Utc>) -> (Str
     }
 }
 
-/// 选出「当前最值得用」的账号下标。筛选与排序规则：
+/// 选出「当前最值得用」的账号下标。分三档候选：
 ///
-/// - 短窗口（5h）必须仍有剩余，否则不可用、不参与；
-/// - 长窗口（7d）已耗尽（used≈100%）的账号排到最后——即便 5h 还有剩余，
-///   7d 用光也基本干不了活，不应作为首选；
-/// - 其余按 5h 剩余降序、7d 剩余降序、priority 升序、id 升序排序。
+/// - `full`（完全健康）：5h 与 7d 都仍有剩余——首选，按 5h 剩余降序、7d 剩余降序排序；
+/// - `long_only`（可恢复）：7d 仍有剩余、仅 5h 暂时耗尽——按 7d 剩余（可恢复性）降序；
+/// - `short_only`（仅剩 5h）：5h 仍有剩余、但 7d 已彻底耗尽——按 5h 剩余降序。
+///
+/// 优先完全健康的账号；当**没有任何账号双窗口都健康（都不够）**时，退而求其次：
+/// 选「可恢复」（7d 还有剩余、过会儿 5h 就会重置）的账号，而不是「7d 已死、只剩当下 5h」
+/// 的账号——后者的可恢复性更差。这与 `auto` / `watch` 的诉求一致：宁可等一个能恢复的账号。
 ///
 /// 返回 None 表示没有可用账号。
 fn compute_recommend(rows: &[Row]) -> Option<usize> {
-    let mut cands: Vec<(bool, f64, f64, i32, String, usize)> = Vec::new();
+    // (5h剩余, 7d剩余, priority, id, idx)
+    let mut full: Vec<(f64, f64, i32, String, usize)> = Vec::new();
+    let mut long_only: Vec<(f64, f64, i32, String, usize)> = Vec::new();
+    let mut short_only: Vec<(f64, f64, i32, String, usize)> = Vec::new();
+
     for (i, row) in rows.iter().enumerate() {
         let Some(quotas) = row.quotas() else {
             continue;
@@ -495,32 +502,55 @@ fn compute_recommend(rows: &[Row]) -> Option<usize> {
             .find(|q| q.window == QuotaWindow::FiveHour)
             .and_then(|q| q.usage_ratio().map(|r| 1.0 - r))
             .unwrap_or(0.0);
-        if short_rem <= 0.0 {
-            continue; // 短窗口耗尽，不可用
-        }
-        let (long_rem, long_exhausted) = quotas
+        let long_rem = quotas
             .iter()
             .find(|q| q.window == QuotaWindow::SevenDay)
             .and_then(|q| q.usage_ratio())
-            .map(|r| (1.0 - r, r >= 1.0))
-            .unwrap_or((0.0, false));
-        cands.push((
-            long_exhausted,
+            .map(|r| 1.0 - r)
+            .unwrap_or(0.0);
+
+        let entry = (
             short_rem,
             long_rem,
             row.account.priority,
             row.account.id.0.clone(),
             i,
-        ));
+        );
+        if short_rem > 0.0 && long_rem > 0.0 {
+            full.push(entry);
+        } else if long_rem > 0.0 {
+            long_only.push(entry); // 可恢复：7d 还有，5h 暂时耗尽
+        } else if short_rem > 0.0 {
+            short_only.push(entry); // 仅剩当下 5h，7d 已死
+        }
     }
-    cands.sort_by(|a, b| {
-        a.0.cmp(&b.0) // 7d 耗尽的排后面
-            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)) // 5h 剩余降序
-            .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal)) // 7d 剩余降序
-            .then(a.3.cmp(&b.3)) // priority 升序
-            .then(a.4.cmp(&b.4)) // id 升序
-    });
-    cands.first().map(|c| c.5)
+
+    // 健康档：先比当前 5h 剩余，再比 7d 剩余。
+    let by_short = |a: &(f64, f64, i32, String, usize), b: &(f64, f64, i32, String, usize)| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    };
+    // 可恢复档：先比可恢复性（7d 剩余），再比当下 5h 剩余。
+    let by_recover = |a: &(f64, f64, i32, String, usize), b: &(f64, f64, i32, String, usize)| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
+            .then(a.2.cmp(&b.2))
+            .then(a.3.cmp(&b.3))
+    };
+
+    full.sort_by(by_short);
+    long_only.sort_by(by_recover);
+    short_only.sort_by(by_short);
+
+    full
+        .first()
+        .or_else(|| long_only.first())
+        .or_else(|| short_only.first())
+        .map(|e| e.4)
 }
 
 /// 是否所有账号的 7d 窗口都已耗尽（用于底部警告）。
