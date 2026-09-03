@@ -112,10 +112,13 @@ enum Cmd {
     /// to it, then re-runs <command>. The screen is cleared between polls instead of
     /// spam-printing. <command> is checked for usability (script exists + shell syntax)
     /// before the first run.
+    #[command(trailing_var_arg = true)]
     Watch {
         /// Shell command / script to run when an account has quota.
+        /// 可传多个参数，会按空格拼接成一条命令；含空格的片段请用引号。
         /// Example: `kimi-switch watch 'bash run.sh'`.
-        command: String,
+        #[arg(num_args(1..), required = true, value_name = "COMMAND")]
+        command: Vec<String>,
         /// 生效次数：执行多少次后退出（默认无限）。
         #[arg(short = 'c', long = "cnt")]
         cnt: Option<usize>,
@@ -1158,7 +1161,8 @@ fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
 
 /// watch 主循环：清屏 → 渲染监控表 → 若有账号有 5h 额度就切到它并执行命令；
 /// 额度用光则等待（轮询）到有额度再切换后执行。`--cnt` 限制有效执行次数。
-async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: u64) -> Result<()> {
+async fn watch(ctx: &AppContext, command: Vec<String>, cnt: Option<usize>, interval: u64) -> Result<()> {
+    let command = command.join(" ");
     validate_shell_command(&command)?;
 
     // watch 日志写到系统临时目录（见 watch_log_path），与 GUI 数据目录完全无关，
