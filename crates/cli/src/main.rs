@@ -1100,7 +1100,9 @@ fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
 async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: u64) -> Result<()> {
     validate_shell_command(&command)?;
 
-    let log_path = AppPaths::resolve()?.config_dir.join("watch.log");
+    // watch 日志是运行时产生的可丢弃数据，放到 cache 目录（macOS 下为
+    // ~/Library/Caches/dev.kimi-switch.kimi-switch/），避免污染 GUI 的 config 目录。
+    let log_path = AppPaths::resolve()?.cache_dir.join("watch.log");
     let total = cnt.unwrap_or(usize::MAX);
     let mut done = 0usize;
     let mut last_run_at: Option<DateTime<Utc>> = None;
