@@ -1,0 +1,14 @@
+crates/cli/src/main.rs
+  h_53aea25a6c6376 479,481-487,491-495,505,509-512,518-525,527-553
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.0",
+  "base_commit_sha": "5892f95ee0ec18c0edb8c70445be688ddf0b9086",
+  "prompts": {},
+  "humans": {
+    "h_53aea25a6c6376": {
+      "author": "彭添 <pengtian@intra.nsfocus.com>"
+    }
+  }
+}
