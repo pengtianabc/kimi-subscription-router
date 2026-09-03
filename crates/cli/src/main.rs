@@ -1057,6 +1057,33 @@ fn validate_shell_command(cmd: &str) -> Result<()> {
     Ok(())
 }
 
+/// watch 日志写入系统临时目录（与 GUI 数据目录完全无关），并限制单文件大小。
+const WATCH_LOG_MAX_BYTES: u64 = 1 << 20; // 1 MiB
+
+/// watch 日志路径：系统临时目录下的 `kimi-switch/watch.log`。
+/// 即便完全没有安装 GUI app，也能正常创建（只依赖标准临时目录）。
+fn watch_log_path() -> PathBuf {
+    let dir = std::env::temp_dir().join("kimi-switch");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("watch.log")
+}
+
+/// 打开 watch 日志：若已超出大小上限，只保留末尾部分，避免文件无限增长。
+fn open_watch_log(path: &Path) -> Result<std::fs::File> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > WATCH_LOG_MAX_BYTES {
+            let data = std::fs::read(path)?;
+            let keep = &data[data.len().saturating_sub(WATCH_LOG_MAX_BYTES as usize)..];
+            std::fs::write(path, keep)?;
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .context("open watch log file")
+}
+
 /// 执行 shell 命令：实时输出同时打到终端与 watch 日志文件，返回退出码。
 /// 用 `(command) 2>&1` 把 stderr 并到 stdout，便于统一捕获。
 fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
@@ -1068,11 +1095,7 @@ fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
         .with_context(|| format!("failed to spawn shell for: {command}"))?;
 
     let stamp = Utc::now().to_rfc3339();
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)
-        .context("open watch log file")?;
+    let mut log = open_watch_log(log_path)?;
     let _ = writeln!(log, "=== run @ {stamp} :: {command} ===");
 
     let stdout = child.stdout.take().context("no stdout from child")?;
@@ -1100,9 +1123,9 @@ fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
 async fn watch(ctx: &AppContext, command: String, cnt: Option<usize>, interval: u64) -> Result<()> {
     validate_shell_command(&command)?;
 
-    // watch 日志是运行时产生的可丢弃数据，放到 cache 目录（macOS 下为
-    // ~/Library/Caches/dev.kimi-switch.kimi-switch/），避免污染 GUI 的 config 目录。
-    let log_path = AppPaths::resolve()?.cache_dir.join("watch.log");
+    // watch 日志写到系统临时目录（见 watch_log_path），与 GUI 数据目录完全无关，
+    // 且单文件大小受 WATCH_LOG_MAX_BYTES 限制。
+    let log_path = watch_log_path();
     let total = cnt.unwrap_or(usize::MAX);
     let mut done = 0usize;
     let mut last_run_at: Option<DateTime<Utc>> = None;
