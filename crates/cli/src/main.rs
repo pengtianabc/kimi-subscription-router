@@ -1060,9 +1060,14 @@ fn validate_shell_command(cmd: &str) -> Result<()> {
 /// watch 日志写入系统临时目录（与 GUI 数据目录完全无关），并限制单文件大小。
 const WATCH_LOG_MAX_BYTES: u64 = 100 * 1024; // 100 KiB
 
-/// watch 日志路径：系统临时目录下的 `kimi-switch/watch.log`。
-/// 即便完全没有安装 GUI app，也能正常创建（只依赖标准临时目录）。
+/// watch 日志路径：优先放到系统 tmpfs（Linux 的 `/dev/shm`），否则退回标准临时目录。
+/// tmpfs 位于内存，重启即清空，且不占磁盘；macOS 默认没有用户级 tmpfs，
+/// 会退回 `temp_dir()`（仍与 GUI 数据目录无关）。
 fn watch_log_path() -> PathBuf {
+    let shm = Path::new("/dev/shm");
+    if shm.is_dir() && std::fs::create_dir_all(shm.join("kimi-switch")).is_ok() {
+        return shm.join("kimi-switch").join("watch.log");
+    }
     let dir = std::env::temp_dir().join("kimi-switch");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("watch.log")
