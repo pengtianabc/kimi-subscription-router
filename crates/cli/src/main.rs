@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, NaiveDate, Utc};
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthChar;
 use clap::{Parser, Subcommand};
 use kimi_switch_core::paths::AppPaths;
 use kimi_switch_core::{
@@ -360,19 +360,52 @@ enum Align {
     Right,
 }
 
+/// 单字符显示宽度。基础值来自 `unicode-width`（CJK/emoji/全角 = 2，拉丁 = 1）。
+///
+/// 例外：Tai Le / New Tai Lue / Balinese / Cham / Tai Tham 等文字在 UCD 里标记为
+/// EAW=N（→1），但常被当作「颜文字」装饰（如 `ᥬ😳᭄`）使用，多数终端按 2 列渲染
+/// （或缺失字形时显示成占 2 格的豆腐块）。这里统一按 2 列计，使账号名列边框与实际
+/// 渲染对齐——字符本身原样输出，不改变文案。
+fn char_width(c: char) -> usize {
+    let base = UnicodeWidthChar::width(c).unwrap_or(1);
+    if base == 1 && is_decorative_wide_script(c) {
+        2
+    } else {
+        base
+    }
+}
+
+/// 这些文字块在终端里普遍被渲染为 2 列，需要补宽以保证表格对齐。
+fn is_decorative_wide_script(c: char) -> bool {
+    let u = c as u32;
+    matches!(
+        u,
+        0x1950..=0x197F   // Tai Le
+        | 0x1980..=0x19DF // New Tai Lue
+        | 0x1A20..=0x1AAF // Tai Tham
+        | 0x1B00..=0x1B7F // Balinese
+        | 0xAA00..=0xAA5F // Cham
+    )
+}
+
+/// 整串显示宽度：逐字符用 [`char_width`] 求和。
+fn str_width(s: &str) -> usize {
+    s.chars().map(char_width).sum()
+}
+
 /// 按显示宽度截断（超出加 `…`）并补齐到 `width` 列。`align` 控制左右 / 居中。
 fn pad_cell(s: &str, width: usize, align: Align) -> String {
     let mut out = String::new();
     let mut w = 0usize;
     for c in s.chars() {
-        let cw = UnicodeWidthChar::width(c).unwrap_or(1);
+        let cw = char_width(c);
         if w + cw > width {
             break;
         }
         out.push(c);
         w += cw;
     }
-    if w < UnicodeWidthStr::width(s) {
+    if w < str_width(s) {
         // 被截断，尽量补一个省略号（U+2026 占 1 列）。
         if w < width {
             out.push('…');
