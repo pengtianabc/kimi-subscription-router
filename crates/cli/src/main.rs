@@ -125,6 +125,10 @@ enum Cmd {
         /// 轮询间隔（秒）。
         #[arg(long, default_value_t = 30)]
         interval: u64,
+        /// 粘性模式：当前激活账号只要还有 5h 额度就直接用它跑命令，
+        /// 仅当当前账号 5h 用尽时才切换到推荐账号。默认会切到「剩余 5h 最多」的推荐账号。
+        #[arg(long = "sticky")]
+        sticky: bool,
     },
 }
 
@@ -216,7 +220,8 @@ async fn main() -> Result<()> {
             command,
             cnt,
             interval,
-        }) => watch(&ctx, command, cnt, interval).await,
+            sticky,
+        }) => watch(&ctx, command, cnt, interval, sticky).await,
     }
 }
 
@@ -1159,9 +1164,24 @@ fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
     Ok(code)
 }
 
+/// 账号是否仍有 5h 额度可用（剩余 > 0）。
+fn row_has_5h(row: &Row) -> bool {
+    row.quotas()
+        .and_then(|q| q.iter().find(|q| q.window == QuotaWindow::FiveHour))
+        .and_then(|q| q.usage_ratio())
+        .map(|r| r < 1.0)
+        .unwrap_or(false)
+}
+
 /// watch 主循环：清屏 → 渲染监控表 → 若有账号有 5h 额度就切到它并执行命令；
 /// 额度用光则等待（轮询）到有额度再切换后执行。`--cnt` 限制有效执行次数。
-async fn watch(ctx: &AppContext, command: Vec<String>, cnt: Option<usize>, interval: u64) -> Result<()> {
+async fn watch(
+    ctx: &AppContext,
+    command: Vec<String>,
+    cnt: Option<usize>,
+    interval: u64,
+    sticky: bool,
+) -> Result<()> {
     let command = command.join(" ");
     validate_shell_command(&command)?;
 
@@ -1181,6 +1201,16 @@ async fn watch(ctx: &AppContext, command: Vec<String>, cnt: Option<usize>, inter
             return Ok(());
         }
         let rec_idx = compute_recommend(&rows);
+        // --sticky：当前激活账号仍可用（还有 5h 额度）就原地使用，避免无谓切换；
+        // 仅当当前账号 5h 用尽时才退回推荐账号。默认（非 sticky）始终切到推荐账号。
+        let target_idx = if sticky {
+            rows
+                .iter()
+                .position(|r| r.account.active && row_has_5h(r))
+                .or(rec_idx)
+        } else {
+            rec_idx
+        };
         render_table(&rows, rec_idx);
 
         println!("▶ watch: {command}");
@@ -1211,7 +1241,7 @@ async fn watch(ctx: &AppContext, command: Vec<String>, cnt: Option<usize>, inter
             break;
         }
 
-        match rec_idx {
+        match target_idx {
             None => {
                 println!("  ⏳ no 5h quota available anywhere; waiting for reset…");
                 tokio::time::sleep(Duration::from_secs(interval)).await;
