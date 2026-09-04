@@ -200,9 +200,10 @@ macOS（开发构建的二进制名为 `kimi-switch-cli`，发布包中名为 `K
 "./kimi-switch-cli" rm <编号或 ID>                    # 删除账号
 "./kimi-switch-cli" auto                             # 按额度自动切换到最优账号
 "./kimi-switch-cli" auto --dry-run                   # 只打印会切到的账号，不真正切换
-"./kimi-switch-cli" watch 'bash run.sh'              # 循环监控额度：当前账号 5h 用光后自动切换到有额度的账号并执行命令
+"./kimi-switch-cli" watch 'bash run.sh'              # 循环监控额度：一旦出现有 5h 额度的账号就执行命令（并自动切到最优账号）
 "./kimi-switch-cli" watch --cnt 3 'bash run.sh'       # 只生效 3 次（执行 3 次后退出）
 "./kimi-switch-cli" watch --interval 60 'bash run.sh' # 每 60 秒轮询一次
+"./kimi-switch-cli" watch --run-on-start=false 'bash run.sh'  # lazy：启动不调用，仅额度从「无」跳变到「有」时才触发
 ```
 
 Windows PowerShell（发布包中使用 `Kimi Subscription Router CLI.exe`，子命令相同）：
@@ -218,7 +219,7 @@ Windows PowerShell（发布包中使用 `Kimi Subscription Router CLI.exe`，子
 - `list` / 无参数：以表格展示每个账号的当前激活标记、用户名（优先显示邮箱或别名）、5 小时与 7 天额度已用百分比，并自动计算 `RECOMMEND` 列指出当前最值得使用的账号。带 `--json` 会输出含邮箱、`displayLabel` 与 `recommend` 字段的 JSON，便于脚本解析。
 - `set`：更新账号元数据。`--label` 设置别名；`--priority` 取值范围 -10000~10000，数值越小在自动切换中越优先；`--routing-enabled` 设置是否参与自动路由；`--subscription-expires-on` 记录订阅到期日（YYYY-MM-DD，传空串清除）。
 - `auto`：依据额度自动切换当前账号。筛选与排序规则为：5 小时窗口必须仍有剩余；7 天已耗尽（已用约 100%）的账号排到最后，即便 5h 还有剩余；其余按 5h 剩余降序、7d 剩余降序、priority 升序、id 升序选择。加 `--dry-run` 只预览不切换。
-- `watch`：常驻监控额度并循环执行指定命令，适合「脚本跑 kimi 任务、额度用光就停、等有额度再自动切换接着跑」的场景。启动时仅做 `bash -n` 语法检查（脚本文件无需预先存在，可以先启动 watch 再补脚本）；每次执行前再确认引用的脚本文件已就绪，缺失则等待而不计入次数。运行时清屏重绘监控表（不刷屏），每隔 `--interval` 秒（默认 30）轮询一次；若当前激活账号 5h 额度耗尽，会等待到有额度的账号并自动切换，再执行命令并实时打印其输出（同时落盘到配置目录的 `watch.log`）。`--cnt|-c` 限制生效次数（默认无限），达到次数后退出。
+- `watch`：常驻监控额度并循环执行指定命令，适合「脚本跑 kimi 任务、额度用光就停、等有额度再自动切换接着跑」的场景。触发规则与「是否切换账号」解耦：只要存在有 5h 额度的账号（无论从「无额度」跳变到「有额度」，还是启动首轮且开启 `--run-on-start`）就执行命令；其中「无额度 → 有额度」的跳变必定触发，与是否切换账号无关。`--run-on-start`（默认开启）控制启动首轮若已有额度是否立即执行，关闭则变为 lazy 模式、等待下一轮跳变才触发。启动时仅做 `bash -n` 语法检查（脚本文件无需预先存在，可以先启动 watch 再补脚本）；每次执行前再确认引用的脚本文件已就绪，缺失则等待而不计入次数。运行时清屏重绘监控表（不刷屏），状态栏显示已执行次数、上次执行时间与退出码，每隔 `--interval` 秒（默认 30）轮询一次；若当前激活账号不是最优账号会自动切换。命令输出实时打印并同时落盘到临时目录 `/tmp/kimi-switch/kimi-watch.log`（单文件上限 100KiB，超出只保留末尾；该路径位于系统临时区、与 GUI 数据目录无关）。`--cnt|-c` 限制生效次数（默认无限），达到次数后退出。
 
 GUI 和 CLI 使用同一份本机账号库，可以混合使用。
 

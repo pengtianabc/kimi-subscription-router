@@ -105,13 +105,23 @@ enum Cmd {
         dry_run: bool,
     },
 
-    /// Watch quota and keep running <command> on whichever account has 5h quota.
+    /// Watch quota and keep running <command> whenever a 5h-quota account becomes available.
     ///
-    /// The program blocks and polls quota on an interval. When the active account's
-    /// 5h quota runs out, it waits until some account has quota available, auto-switches
-    /// to it, then re-runs <command>. The screen is cleared between polls instead of
-    /// spam-printing. <command> is checked for usability (script exists + shell syntax)
-    /// before the first run.
+    /// The program blocks and polls quota on an interval. When *no* account has 5h quota
+    /// (all exhausted), it waits. As soon as *any* account regains 5h quota — whether by
+    /// a scheduled reset or by an auto-switch to a healthier account — it runs <command>.
+    /// The screen is cleared between polls instead of spam-printing.
+    ///
+    /// Triggering is decoupled from account switching:
+    ///  - A command fires on the rising edge "no quota → has quota" unconditionally.
+    ///  - At startup, if quota is already available it fires only when `--run-on-start`
+    ///    is on (default); with `--run-on-start=false` it stays lazy and waits for the
+    ///    next reset edge.
+    ///  - Account switching (to the best available account) happens independently, so the
+    ///    active account always lands on the most-quota account regardless of triggering.
+    ///
+    /// <command> is syntax-checked (`bash -n`/`sh -n`) at startup; a referenced script is
+    /// allowed to not exist yet and is re-checked for readiness before each run.
     #[command(trailing_var_arg = true)]
     Watch {
         /// Shell command / script to run when an account has quota.
@@ -125,10 +135,11 @@ enum Cmd {
         /// 轮询间隔（秒）。
         #[arg(long, default_value_t = 30)]
         interval: u64,
-        /// 粘性模式：当前激活账号只要还有 5h 额度就直接用它跑命令，
-        /// 仅当当前账号 5h 用尽时才切换到推荐账号。默认会切到「剩余 5h 最多」的推荐账号。
-        #[arg(long = "sticky")]
-        sticky: bool,
+        /// 启动即调用：若启动首轮就有可用 5h 额度的账号，立即执行命令（默认开启）。
+        /// 关闭后变为 lazy：启动时不调用，仅当额度从「无」跳变到「有」时才触发。
+        /// 注意：无论是否开启，从「无额度 → 有额度」的跳变都会触发命令（与是否切换账号无关）。
+        #[arg(long = "run-on-start", default_value_t = true)]
+        run_on_start: bool,
     },
 }
 
@@ -220,8 +231,8 @@ async fn main() -> Result<()> {
             command,
             cnt,
             interval,
-            sticky,
-        }) => watch(&ctx, command, cnt, interval, sticky).await,
+            run_on_start,
+        }) => watch(&ctx, command, cnt, interval, run_on_start).await,
     }
 }
 
@@ -1164,23 +1175,15 @@ fn run_command_logged(command: &str, log_path: &Path) -> Result<i32> {
     Ok(code)
 }
 
-/// 账号是否仍有 5h 额度可用（剩余 > 0）。
-fn row_has_5h(row: &Row) -> bool {
-    row.quotas()
-        .and_then(|q| q.iter().find(|q| q.window == QuotaWindow::FiveHour))
-        .and_then(|q| q.usage_ratio())
-        .map(|r| r < 1.0)
-        .unwrap_or(false)
-}
-
-/// watch 主循环：清屏 → 渲染监控表 → 若有账号有 5h 额度就切到它并执行命令；
-/// 额度用光则等待（轮询）到有额度再切换后执行。`--cnt` 限制有效执行次数。
+/// watch 主循环：清屏 → 渲染监控表 → 轮询账号额度。
+/// 触发规则（与「是否切换账号」无关）：仅当「存在 5h 额度的账号」从「无」变为「有」时，
+/// 或（启动首轮且开启 `--run-on-start`）才执行命令；额度用光则等待下次跳变。
 async fn watch(
     ctx: &AppContext,
     command: Vec<String>,
     cnt: Option<usize>,
     interval: u64,
-    sticky: bool,
+    run_on_start: bool,
 ) -> Result<()> {
     let command = command.join(" ");
     validate_shell_command(&command)?;
@@ -1192,6 +1195,8 @@ async fn watch(
     let mut done = 0usize;
     let mut last_run_at: Option<DateTime<Utc>> = None;
     let mut last_exit: Option<i32> = None;
+    // 上一轮「是否存在有 5h 额度的账号」；None 表示尚未轮询过（用于判定启动首轮）。
+    let mut prev_available: Option<bool> = None;
 
     loop {
         clear_screen();
@@ -1201,16 +1206,6 @@ async fn watch(
             return Ok(());
         }
         let rec_idx = compute_recommend(&rows);
-        // --sticky：当前激活账号仍可用（还有 5h 额度）就原地使用，避免无谓切换；
-        // 仅当当前账号 5h 用尽时才退回推荐账号。默认（非 sticky）始终切到推荐账号。
-        let target_idx = if sticky {
-            rows
-                .iter()
-                .position(|r| r.account.active && row_has_5h(r))
-                .or(rec_idx)
-        } else {
-            rec_idx
-        };
         render_table(&rows, rec_idx);
 
         println!("▶ watch: {command}");
@@ -1241,23 +1236,23 @@ async fn watch(
             break;
         }
 
-        match target_idx {
-            None => {
-                println!("  ⏳ no 5h quota available anywhere; waiting for reset…");
-                tokio::time::sleep(Duration::from_secs(interval)).await;
-            }
-            Some(idx) => {
-                // 执行前再确认脚本已就绪（允许 watch 在脚本尚未创建时就启动）。
-                // 脚本缺失时不切账号、不计入次数，只等待其出现后下一轮再执行。
-                if let Some(missing) = missing_script(&command) {
-                    println!(
-                        "  ⏳ script not ready: {} (waiting for it to appear before running)",
-                        missing.display()
-                    );
-                    tokio::time::sleep(Duration::from_secs(interval)).await;
-                    continue;
-                }
+        // 本轮是否存在「有 5h 额度」的账号（即推荐目标是否存在）。
+        let has_quota = rec_idx.is_some();
 
+        // 触发命令的条件（与是否切换账号无关）：
+        //  - 上升沿：上一轮没有额度、本轮有了 → 必定触发；
+        //  - 启动首轮：当前有额度且开启 --run-on-start → 触发（否则进入 lazy 等待）。
+        let fire = has_quota
+            && match prev_available {
+                None => run_on_start,
+                Some(false) => true,
+                Some(true) => false,
+            };
+
+        // 切换逻辑与命令触发解耦：只要本轮有可用额度、且当前激活账号不是推荐账号，
+        // 就切过去，保证后续轮询/手动使用都落在额度最充足的账号上。
+        if has_quota {
+            if let Some(idx) = rec_idx {
                 let target = &rows[idx];
                 let active_idx = rows.iter().position(|r| r.account.active);
                 if active_idx != Some(idx) {
@@ -1277,13 +1272,40 @@ async fn watch(
                         }
                         Err(e) => {
                             eprintln!("  switch failed: {e}");
-                            tokio::time::sleep(Duration::from_secs(interval)).await;
-                            continue;
                         }
                     }
                 }
+            }
+        }
 
-                println!("  ▶ run #{}{}: {}", done + 1, if total != usize::MAX { format!(" (of {total})") } else { String::new() }, command);
+        if !has_quota {
+            println!("  ⏳ no 5h quota available anywhere; waiting for reset…");
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+        } else if !fire {
+            println!(
+                "  ⏳ quota available; waiting for next reset edge (lazy: --run-on-start off)…"
+            );
+            tokio::time::sleep(Duration::from_secs(interval)).await;
+        } else {
+            // 执行前再确认脚本已就绪（允许 watch 在脚本尚未创建时就启动）。
+            // 脚本缺失时不计入次数，等其出现后下一轮再执行。
+            if let Some(missing) = missing_script(&command) {
+                println!(
+                    "  ⏳ script not ready: {} (waiting for it to appear before running)",
+                    missing.display()
+                );
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+            } else {
+                println!(
+                    "  ▶ run #{}{}: {}",
+                    done + 1,
+                    if total != usize::MAX {
+                        format!(" (of {total})")
+                    } else {
+                        String::new()
+                    },
+                    command
+                );
                 println!("  ────────────────────────────────");
                 let code = run_command_logged(&command, &log_path)?;
                 println!("  ────────────────────────────────");
@@ -1296,6 +1318,9 @@ async fn watch(
                 tokio::time::sleep(Duration::from_secs(interval)).await;
             }
         }
+
+        // 记录本轮额度状态，供下轮检测「无 → 有」跳变。
+        prev_available = Some(has_quota);
     }
     Ok(())
 }
